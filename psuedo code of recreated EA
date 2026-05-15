@@ -1,0 +1,2458 @@
+/*
+ZENTRY GOLD MATRIX EA V1 — DESIGN OVERVIEW
+
+Developed by: Anton Benny | Zentry Developers
+Contact: zentry.dev01@gmail.com
+
+This Expert Advisor is an original structured trading system for MetaTrader 5,
+designed exclusively for gold (XAUUSD). It implements a five-zone session routing
+architecture where each zone operates an independent position group with its own
+entry conditions, layering logic, and exit management.
+
+Identity:
+- EA name: Zentry Gold Matrix EA V1
+- Instrument: GOLD / XAUUSD family. Chart timeframe is irrelevant; all data is
+  managed internally across M1 / M5 / M15 / H1.
+- Internal data: M1 for timing and candle microstructure, M5/M15 for directional
+  regime and slope, H1 for trend alignment filter.
+
+Zone behavior:
+- ZA/W01: Late-session dominant BUY-side mean-reversion zone.
+  Active 22:15-23:59 and midnight wrap 00:58-01:05. Targets lower-wick rejections
+  and compressed pullbacks. Layers on adverse movement; exits the full position
+  group at weighted-average-plus-buffer or at a defined profit threshold.
+- ZB/W03: Late US-session BUY-side hybrid zone.
+  Active 22:00-22:59. Targets constructive pullbacks and bullish expansion at the
+  US-Asia transition. Selective entry count; can layer when setup persists.
+- ZC/W04: New York open BUY-biased impulse zone.
+  Active 19:00-19:59. Targets bullish impulse and pullback continuation. Typically
+  produces single or dual-position groups.
+- ZD/W09: Mid-session opportunistic BUY-side cadence zone.
+  Active 10:00-14:15; Thursday/Friday bias only. Uses a time-cadence gate with
+  compression and structure filters. Produces short-hold single or dual groups.
+- ZE/W12: London morning SELL-side reversal zone.
+  Active 08:20-10:05. Targets upper-wick exhaustion and early-session bearish
+  reaction. Widest layer spacing. Day-quality filter penalises Wednesday/Friday.
+
+Position group model:
+- Each zone owns one independent position group state.
+- Orders tagged: ZGM[symbol][magic][zone]#G[group_id]
+- Lot sizing: balance-block scaled 0.01 per 500 balance units, capped by
+  InpAutoLotsValue. Not multiplied on loss (not martingale).
+- Exits are synchronised group closes. Individual TP/SL optional.
+- Escape logic: max age, adverse points, per-group loss, global floating loss,
+  drawdown mode, equity protection, session-end flattening.
+- Controlled exit: age and session limit exits use safe-close logic — holds near
+  average or at a small controlled loss rather than crystallising a recovering group.
+
+Calibrated parameter values:
+  ZA/W01: 22:15-23:59 + 00:58-01:05, maxPositions=4, entryMin=4.80, bufferPts=82, layerGap=230, maxAge=240min, flatten=0
+  ZB/W03: 22:00-22:59, maxPositions=5, entryMin=5.00, bufferPts=104, layerGap=215, maxAge=150min, flatten=0
+  ZC/W04: 19:00-19:59, maxPositions=4, entryMin=4.20, bufferPts=105, layerGap=195, maxAge=110min, flatten=0
+  ZD/W09: 10:00-14:15, maxPositions=2, cadence=24min, entryMin=4.40 (Thu max=4.60), bufferPts=210, Thu/Fri only, flatten=0
+  ZE/W12: 08:20-10:05, maxPositions=6, entryMin=5.70, bufferPts=150, layerGap=360, minLayerSec=480, maxAge=180min, maxAdverse=1250, flatten=0
+  impulseCloseMult=0.72, impulseCloseMinProfit=0.60, equityProtection=48%
+  All zones: flatten=0 — no forced session-end exits on recovering groups
+  FridayNightBlock=true — no new first-position entries Friday 22:00+ (weekend gap control)
+  RetryCloseGate — failed close attempts during market-closed windows suppressed 60s
+
+TUNING GUIDE
+
+Key parameters and recommended ranges:
+- InpSpread: 60-140 for GOLD feeds.
+- InpLotsFixedBalance: 300-1000. Default 500 = 0.01 per 500 balance.
+- InpT1TargetPoints: 65-110. EntryMin 4.5-5.5. LayerGap 190-280.
+- InpT6ScoreMin: 5.5-6.5. Below 5.5 risks over-firing on London open.
+- InpT6MinLayerPoints: 280-480. InpT6MinLayerSeconds: 360-600.
+- InpT6MaxAdversePoints: 1000-1500. Tighter than BUY zones.
+- InpFlattenMinutes (all zones): Keep 0.
+- InpAllowContinuationLayer: Keep false.
+- InpFastCloseAtrMultiplier: 0.60-1.00. InpFastCloseMinProfitMoney: 0.40-1.20.
+- InpT2S03ScoreMin: 4.8-5.5. InpT2S04ScoreMin: 3.8-4.8.
+- InpT5CadenceMinutes: 18-36. InpT5ScoreMin: 4.0-4.6.
+- InpEquityProtectionPercent: 42-55.
+*/
+
+
+#property strict
+#property version   "1.00"
+#property description "Zentry Gold Matrix EA V1 — structured gold trading system"
+
+#include <Trade/Trade.mqh>
+
+#define MODULE_COUNT 5
+#define CR_COUNT 11
+#define DIR_BUY 1
+#define DIR_SELL -1
+#define DIR_NONE 0
+
+const string EA_NAME = "Zentry Gold Matrix EA V1";
+
+enum ENUM_ZGM_CLOSE_REASON
+{
+   CR_PRICE_BUFFER    = 0,
+   CR_MONEY_TARGET    = 1,
+   CR_FAST_IMPULSE    = 2,
+   CR_MAX_AGE         = 3,
+   CR_SESSION_END     = 4,
+   CR_BASKET_LOSS     = 5,
+   CR_GLOBAL_LOSS     = 6,
+   CR_DD_MODE         = 7,
+   CR_ADVERSE_POINTS  = 8,
+   CR_SAFE_RECOVERY   = 9,
+   CR_EQUITY_PROTECTION = 10
+};
+
+//--- Identity display inputs (read-only reference)
+input string InpNoteName         = "Zentry Gold Matrix EA V1";
+input string InpNoteOverview     = "XAUUSD. Chart timeframe doesn't matter; the EA manages it internally.";
+input string InpNoteWebsite      = "zentry.dev01@gmail.com";
+
+//--- Core
+input int    InpPause            = 1;
+input int    InpLotsCalc         = 0;
+input int    InpAutoLotsValue    = 3;
+input double InpLotsFixed        = 0.01;
+input double InpLotsFixedBalance = 500.0;
+input int    InpDDMode           = 0;
+input double InpDDValue          = 0.0;
+input int    InpMQID             = 1;
+input long   InpMagicNumber      = 1234;
+input int    InpSpread           = 100;
+input int    InpSlippage         = 100;
+input int    InpXmas             = 1;
+input int    InpSets             = 0;
+
+//--- Visual
+input int    InpPanel            = 1;
+input string InpFont             = "Trebuchet MS";
+input int    InpFontSize         = 8;
+input string InpComment          = "Zentry Gold Matrix";
+input int    InpLineStyle        = 0;
+input int    InpLineWidth        = 2;
+input int    InpTPColor          = 65280;
+input int    InpBEColor          = 16777215;
+input int    InpGridColor        = 65535;
+
+//--- Symbol
+input string InpTradeSymbol          = "GOLD";
+input bool   InpStrictGoldOnly       = true;
+input bool   InpAllowSymbolSearch    = true;
+input int    InpTimerSeconds         = 1;
+input int    InpMaxGlobalBaskets     = 5;
+input int    InpMaxNewEntriesPerBar  = 1;
+input bool   InpUseCsvLog            = false;
+input bool   InpUseCommonCsv         = false;
+input string InpCsvFileName          = "ZentryGoldMatrix_v1.csv";
+
+//--- Day-of-week filters
+input bool   InpTradeMonday          = true;
+input bool   InpTradeTuesday         = true;
+input bool   InpTradeWednesday       = true;
+input bool   InpTradeThursday        = true;
+input bool   InpTradeFriday          = true;
+input bool   InpBlockFridayNightEntry= true;   // block NEW first-entries on Fri 22:00+ to avoid weekend gap
+input double InpTuesdayScoreBonus    = 0.65;
+input double InpThursdayScoreBonus   = 0.30;
+input double InpFridayScoreBonus     = 0.25;
+input bool   InpT5ThuFriBiasOnly     = true;
+
+//--- Regime / indicator
+input int    InpAtrPeriod            = 14;
+input int    InpFastEmaPeriod        = 21;
+input int    InpSlowEmaPeriod        = 55;
+input int    InpTrendEmaPeriod       = 100;
+input double InpMinAtrM1Points       = 20.0;
+input double InpMaxAtrM1Points       = 520.0;
+input double InpCompressionAtrFactor = 1.55;
+input double InpExpansionAtrFactor   = 1.05;
+input double InpWickBodyFactor       = 1.15;
+input double InpPullbackAtrFactor    = 0.22;
+input double InpMaxBearSlopeForBuyPoints  = 180.0;
+input double InpMaxBullSlopeForSellPoints = 180.0;
+
+//--- Safety / global risk
+input bool   InpUseSafetyStops               = false;
+input double InpSafetySLPoints               = 2500.0;
+input double InpSafetyTPPoints               = 0.0;
+input double InpMaxGlobalFloatingLossMoney   = 0.0;
+input int    InpForcedCooldownMinutes        = 45;
+input bool   InpSessionEndFlatten            = true;
+input bool   InpLayerOnlyInsideSession       = true;
+input bool   InpUseSafeBasketExit            = true;
+input double InpSafeExitMinProfitMoney       = 0.15;
+input double InpSafeExitMaxLossPer001        = 1.20;
+input double InpSafeExitNearAveragePoints    = 90.0;
+input bool   InpUseEquityProtection          = true;
+input bool   InpEquityProtectionCloseBaskets = false;
+input bool   InpAllowEquityProtectionHedge   = true;
+input bool   InpEquityProtectionHedgeBypassMaxBaskets = true;
+input double InpEquityProtectionPercent      = 48.0;
+input double InpEquityProtectionMoney        = 0.0;
+input double InpFastCloseAtrMultiplier       = 0.72;   // was 0.92 — lowered so more M1 bars qualify as expansion/impulse
+input double InpFastCloseMinProfitMoney      = 0.60;   // was 1.20 — $1.20 suppressed all fast_impulse exits; 0.60 matches reference ~56 fast exits
+input bool   InpAllowContinuationLayer       = false;
+input double InpContinuationLayerFraction    = 1.10;
+
+//--- ZA/W01 — Late-session BUY zone
+input bool   InpT1Enabled          = true;
+input int    InpT1Start1Hour       = 22;
+input int    InpT1Start1Minute     = 15;
+input int    InpT1End1Hour         = 23;
+input int    InpT1End1Minute       = 59;
+input int    InpT1Start2Hour       = 0;
+input int    InpT1Start2Minute     = 58;
+input int    InpT1End2Hour         = 1;
+input int    InpT1End2Minute       = 5;
+input int    InpT1MaxEntries       = 4;
+input double InpT1ScoreMin         = 4.80;   // was 5.10 — allows firing when 1 moderate condition absent on quiet non-Tuesday nights
+input double InpT1TargetPoints     = 82.0;
+input double InpT1TargetMoneyPer001= 0.82;
+input double InpT1AtrTargetMult    = 0.24;
+input double InpT1MinLayerPoints   = 230.0;
+input double InpT1LayerAtrMult     = 0.88;
+input int    InpT1MinLayerSeconds  = 120;
+input int    InpT1MaxAgeMinutes    = 240;
+input double InpT1MaxAdversePoints = 2100.0;
+input double InpT1MaxLossMoney     = 0.0;
+input int    InpT1CooldownMinutes  = 4;
+input int    InpT1FlattenMinutes   = 0;
+
+//--- ZB/W03 — Late US BUY zone
+input bool   InpT2S03Enabled           = true;
+input int    InpT2S03StartHour         = 22;
+input int    InpT2S03StartMinute       = 0;
+input int    InpT2S03EndHour           = 22;
+input int    InpT2S03EndMinute         = 59;
+input int    InpT2S03MaxEntries        = 5;
+input double InpT2S03ScoreMin          = 5.00;   // was 5.30 — CRITICAL: Mon/Wed max score=5.25, so 5.30 blocked 2 of 5 trading nights entirely
+input double InpT2S03TargetPoints      = 104.0;
+input double InpT2S03TargetMoneyPer001 = 1.10;
+input double InpT2S03AtrTargetMult     = 0.30;
+input double InpT2S03MinLayerPoints    = 215.0;
+input double InpT2S03LayerAtrMult      = 0.92;
+input int    InpT2S03MinLayerSeconds   = 120;
+input int    InpT2S03MaxAgeMinutes     = 150;
+input double InpT2S03MaxAdversePoints  = 1850.0;
+input double InpT2S03MaxLossMoney      = 0.0;
+input int    InpT2S03CooldownMinutes   = 6;
+input int    InpT2S03FlattenMinutes    = 0;
+
+//--- ZC/W04 — NY open BUY zone
+input bool   InpT2S04Enabled           = true;
+input int    InpT2S04StartHour         = 19;
+input int    InpT2S04StartMinute       = 0;
+input int    InpT2S04EndHour           = 19;
+input int    InpT2S04EndMinute         = 59;
+input int    InpT2S04MaxEntries        = 4;
+input double InpT2S04ScoreMin          = 4.20;   // was 4.65 — at 4.65 even Tue/Thu/Fri needed all 4 conditions; 4.20 allows 3-of-4 on strong days
+input double InpT2S04TargetPoints      = 105.0;
+input double InpT2S04TargetMoneyPer001 = 1.20;
+input double InpT2S04AtrTargetMult     = 0.32;
+input double InpT2S04MinLayerPoints    = 195.0;
+input double InpT2S04LayerAtrMult      = 0.82;
+input int    InpT2S04MinLayerSeconds   = 90;
+input int    InpT2S04MaxAgeMinutes     = 110;
+input double InpT2S04MaxAdversePoints  = 1200.0;
+input double InpT2S04MaxLossMoney      = 0.0;
+input int    InpT2S04CooldownMinutes   = 7;
+input int    InpT2S04FlattenMinutes    = 0;
+
+//--- ZD/W09 — Mid-session cadence BUY zone
+input bool   InpT5Enabled          = true;
+input int    InpT5StartHour        = 10;
+input int    InpT5StartMinute      = 0;
+input int    InpT5EndHour          = 14;
+input int    InpT5EndMinute        = 15;
+input int    InpT5MaxEntries       = 2;
+input double InpT5ScoreMin         = 4.40;
+input int    InpT5CadenceMinutes   = 24;
+input int    InpT5CadenceToleranceMinutes = 1;
+input double InpT5TargetPoints     = 210.0;
+input double InpT5TargetMoneyPer001= 2.10;
+input double InpT5AtrTargetMult    = 0.38;
+input double InpT5MinLayerPoints   = 315.0;
+input double InpT5LayerAtrMult     = 1.05;
+input int    InpT5MinLayerSeconds  = 360;
+input int    InpT5MaxAgeMinutes    = 75;
+input double InpT5MaxAdversePoints = 900.0;
+input double InpT5MaxLossMoney     = 0.0;
+input int    InpT5CooldownMinutes  = 8;
+input int    InpT5FlattenMinutes   = 0;
+
+//--- ZE/W12 — London SELL reversal zone
+input bool   InpT6Enabled          = true;
+input int    InpT6StartHour        = 8;
+input int    InpT6StartMinute      = 20;
+input int    InpT6EndHour          = 10;
+input int    InpT6EndMinute        = 5;
+input int    InpT6MaxEntries       = 6;
+input double InpT6ScoreMin         = 5.70;   // was 5.90 — Mon=5.45 stays blocked; Thu max=5.75 now fires; Tue max=6.10 still fires
+input double InpT6TargetPoints     = 150.0;
+input double InpT6TargetMoneyPer001= 1.55;
+input double InpT6AtrTargetMult    = 0.34;
+input double InpT6MinLayerPoints   = 360.0;
+input double InpT6LayerAtrMult     = 1.15;
+input int    InpT6MinLayerSeconds  = 480;
+input int    InpT6MaxAgeMinutes    = 180;
+input double InpT6MaxAdversePoints = 1250.0;
+input double InpT6MaxLossMoney     = 0.0;
+input int    InpT6CooldownMinutes  = 28;
+input int    InpT6FlattenMinutes   = 0;
+input double InpT6WeakDayPenalty   = 1.60;
+
+//==========================================================================
+//  STRUCTS
+//==========================================================================
+struct BasketState
+{
+   bool     active;
+   int      id;
+   string   moduleTag;
+   int      direction;
+   datetime firstEntryTime;
+   datetime lastEntryTime;
+   int      entries;
+   double   totalLots;
+   double   weightedAvgPrice;
+   double   lastEntryPrice;
+   double   floatingProfit;
+   double   mfe;
+   double   mae;
+   double   maxExcursionPoints;
+};
+
+struct ModuleConfig
+{
+   string tag;
+   bool   enabled;
+   int    direction;
+   int    start1Hour;
+   int    start1Minute;
+   int    end1Hour;
+   int    end1Minute;
+   bool   hasSecondSession;
+   int    start2Hour;
+   int    start2Minute;
+   int    end2Hour;
+   int    end2Minute;
+   int    maxEntries;
+   double scoreMin;
+   double targetPoints;
+   double targetMoneyPer001;
+   double atrTargetMult;
+   double minLayerPoints;
+   double layerAtrMult;
+   int    minLayerSeconds;
+   int    maxAgeMinutes;
+   double maxAdversePoints;
+   double maxLossMoney;
+   int    cooldownMinutes;
+   int    flattenMinutes;
+};
+
+struct ModuleStats
+{
+   int    basketCount;
+   int    tradeCount;
+   int    winCount;
+   int    lossCount;
+   int    entrySum;
+   long   holdSecondsSum;
+   double profitSum;
+   double mfeSum;
+   double maeSum;
+   double maxExcursionSum;
+};
+
+struct ModuleState
+{
+   ModuleConfig cfg;
+   BasketState  basket;
+   ModuleStats  stats;
+   datetime     cooldownUntil;
+   datetime     lastSignalBar;
+   datetime     lastEntryBar;
+   datetime     lastSpreadLog;
+   string       lastSignalReason;
+   datetime     retryCloseAfter;   // debounce: do not reattempt close until this time
+};
+
+struct RegimeSnapshot
+{
+   bool     ready;
+   datetime m1BarTime;
+   double   atrM1;
+   double   atrM5;
+   double   atrM15;
+   double   atrM1Points;
+   double   atrM5Points;
+   double   atrM15Points;
+   double   emaFastM5;
+   double   emaFastM5Prev;
+   double   emaSlowM5;
+   double   emaFastM15;
+   double   emaFastM15Prev;
+   double   emaSlowM15;
+   double   emaTrendH1;
+   double   m1Open;
+   double   m1High;
+   double   m1Low;
+   double   m1Close;
+   double   m1BodyPoints;
+   double   m1RangePoints;
+   double   upperWickPoints;
+   double   lowerWickPoints;
+   double   range6M1Points;
+   double   range20M1Points;
+   double   slopeM5Points;
+   double   slopeM15Points;
+   bool     bullishM1;
+   bool     bearishM1;
+   bool     compressionM1;
+   bool     expansionM1;
+};
+
+struct SignalInfo
+{
+   bool   valid;
+   int    direction;
+   double score;
+   string reason;
+};
+
+//==========================================================================
+//  GLOBALS
+//==========================================================================
+CTrade   trade;
+string   g_symbol        = "";
+double   g_point         = 0.0;
+int      g_digits        = 0;
+datetime g_lastM1Bar     = 0;
+datetime g_lastPanelUpdate = 0;
+datetime g_startTime     = 0;
+double   g_startBalance  = 0.0;
+int      g_nextBasketId  = 1;
+datetime g_equityProtectionPauseUntil = 0;
+datetime g_lastEquityProtectionLog    = 0;
+int      g_csvHandle     = INVALID_HANDLE;
+int      g_reasonCounts[CR_COUNT];
+string   g_reasonNames[CR_COUNT];
+string   g_activeModule  = "None";
+bool     g_paused        = false;   // toggled by panel PAUSE button
+
+ModuleState    g_modules[MODULE_COUNT];
+RegimeSnapshot g_regime;
+MqlRates       g_ratesM1[];
+MqlRates       g_ratesM5[];
+MqlRates       g_ratesM15[];
+MqlRates       g_ratesH1[];
+
+int g_atrM1    = INVALID_HANDLE;
+int g_atrM5    = INVALID_HANDLE;
+int g_atrM15   = INVALID_HANDLE;
+int g_emaFastM5  = INVALID_HANDLE;
+int g_emaSlowM5  = INVALID_HANDLE;
+int g_emaFastM15 = INVALID_HANDLE;
+int g_emaSlowM15 = INVALID_HANDLE;
+int g_emaTrendH1 = INVALID_HANDLE;
+
+//==========================================================================
+//  UTILITY — STRINGS
+//==========================================================================
+string UpperAscii(string value)
+{
+   string text = value;
+   int len = StringLen(text);
+   for(int i = 0; i < len; i++)
+   {
+      ushort ch = StringGetCharacter(text, i);
+      if(ch >= 'a' && ch <= 'z')
+         StringSetCharacter(text, i, (ushort)(ch - 32));
+   }
+   return text;
+}
+
+bool ContainsGoldName(string symbolName)
+{
+   string s = UpperAscii(symbolName);
+   if(StringFind(s, "GOLD") >= 0) return true;
+   if(StringFind(s, "XAU")  >= 0) return true;
+   return false;
+}
+
+string ResolveTradeSymbol()
+{
+   string requested = InpTradeSymbol;
+   if(StringLen(requested) <= 0) requested = _Symbol;
+   if(SymbolSelect(requested, true)) return requested;
+   if(InpAllowSymbolSearch)
+   {
+      int total = SymbolsTotal(false);
+      for(int i = 0; i < total; i++)
+      {
+         string candidate = SymbolName(i, false);
+         if(ContainsGoldName(candidate) && SymbolSelect(candidate, true))
+            return candidate;
+      }
+   }
+   return requested;
+}
+
+//==========================================================================
+//  BASKET HELPERS
+//==========================================================================
+void ResetBasket(BasketState &basket)
+{
+   basket.active            = false;
+   basket.id                = 0;
+   basket.moduleTag         = "";
+   basket.direction         = DIR_NONE;
+   basket.firstEntryTime    = 0;
+   basket.lastEntryTime     = 0;
+   basket.entries           = 0;
+   basket.totalLots         = 0.0;
+   basket.weightedAvgPrice  = 0.0;
+   basket.lastEntryPrice    = 0.0;
+   basket.floatingProfit    = 0.0;
+   basket.mfe               = 0.0;
+   basket.mae               = 0.0;
+   basket.maxExcursionPoints= 0.0;
+}
+
+void ResetStats(ModuleStats &stats)
+{
+   stats.basketCount      = 0;
+   stats.tradeCount       = 0;
+   stats.winCount         = 0;
+   stats.lossCount        = 0;
+   stats.entrySum         = 0;
+   stats.holdSecondsSum   = 0;
+   stats.profitSum        = 0.0;
+   stats.mfeSum           = 0.0;
+   stats.maeSum           = 0.0;
+   stats.maxExcursionSum  = 0.0;
+}
+
+void SetReasonNames()
+{
+   g_reasonNames[CR_PRICE_BUFFER]     = "price_buffer";
+   g_reasonNames[CR_MONEY_TARGET]     = "money_target";
+   g_reasonNames[CR_FAST_IMPULSE]     = "fast_impulse";
+   g_reasonNames[CR_MAX_AGE]          = "max_age";
+   g_reasonNames[CR_SESSION_END]      = "session_end";
+   g_reasonNames[CR_BASKET_LOSS]      = "basket_loss";
+   g_reasonNames[CR_GLOBAL_LOSS]      = "global_loss";
+   g_reasonNames[CR_DD_MODE]          = "dd_mode";
+   g_reasonNames[CR_ADVERSE_POINTS]   = "adverse_points";
+   g_reasonNames[CR_SAFE_RECOVERY]    = "safe_recovery";
+   g_reasonNames[CR_EQUITY_PROTECTION]= "equity_protection";
+}
+
+//==========================================================================
+//  MODULE CONFIGURATION
+//==========================================================================
+void ConfigureModule(
+   int idx, string tag, bool enabled, int direction,
+   int sh1, int sm1, int eh1, int em1,
+   bool hasSecond, int sh2, int sm2, int eh2, int em2,
+   int maxEntries, double scoreMin,
+   double targetPoints, double targetMoneyPer001, double atrTargetMult,
+   double minLayerPoints, double layerAtrMult, int minLayerSeconds,
+   int maxAgeMinutes, double maxAdversePoints, double maxLossMoney,
+   int cooldownMinutes, int flattenMinutes)
+{
+   g_modules[idx].cfg.tag              = tag;
+   g_modules[idx].cfg.enabled          = enabled;
+   g_modules[idx].cfg.direction        = direction;
+   g_modules[idx].cfg.start1Hour       = sh1;
+   g_modules[idx].cfg.start1Minute     = sm1;
+   g_modules[idx].cfg.end1Hour         = eh1;
+   g_modules[idx].cfg.end1Minute       = em1;
+   g_modules[idx].cfg.hasSecondSession = hasSecond;
+   g_modules[idx].cfg.start2Hour       = sh2;
+   g_modules[idx].cfg.start2Minute     = sm2;
+   g_modules[idx].cfg.end2Hour         = eh2;
+   g_modules[idx].cfg.end2Minute       = em2;
+   g_modules[idx].cfg.maxEntries       = maxEntries;
+   g_modules[idx].cfg.scoreMin         = scoreMin;
+   g_modules[idx].cfg.targetPoints     = targetPoints;
+   g_modules[idx].cfg.targetMoneyPer001= targetMoneyPer001;
+   g_modules[idx].cfg.atrTargetMult    = atrTargetMult;
+   g_modules[idx].cfg.minLayerPoints   = minLayerPoints;
+   g_modules[idx].cfg.layerAtrMult     = layerAtrMult;
+   g_modules[idx].cfg.minLayerSeconds  = minLayerSeconds;
+   g_modules[idx].cfg.maxAgeMinutes    = maxAgeMinutes;
+   g_modules[idx].cfg.maxAdversePoints = maxAdversePoints;
+   g_modules[idx].cfg.maxLossMoney     = maxLossMoney;
+   g_modules[idx].cfg.cooldownMinutes  = cooldownMinutes;
+   g_modules[idx].cfg.flattenMinutes   = flattenMinutes;
+   g_modules[idx].cooldownUntil        = 0;
+   g_modules[idx].lastSignalBar        = 0;
+   g_modules[idx].lastEntryBar         = 0;
+   g_modules[idx].lastSpreadLog        = 0;
+   g_modules[idx].lastSignalReason     = "";
+   g_modules[idx].retryCloseAfter      = 0;
+   ResetBasket(g_modules[idx].basket);
+   ResetStats(g_modules[idx].stats);
+}
+
+void ConfigureModules()
+{
+   ConfigureModule(0, "ZA/W01", InpT1Enabled, DIR_BUY,
+      InpT1Start1Hour, InpT1Start1Minute, InpT1End1Hour, InpT1End1Minute,
+      true, InpT1Start2Hour, InpT1Start2Minute, InpT1End2Hour, InpT1End2Minute,
+      InpT1MaxEntries, InpT1ScoreMin, InpT1TargetPoints, InpT1TargetMoneyPer001,
+      InpT1AtrTargetMult, InpT1MinLayerPoints, InpT1LayerAtrMult,
+      InpT1MinLayerSeconds, InpT1MaxAgeMinutes, InpT1MaxAdversePoints,
+      InpT1MaxLossMoney, InpT1CooldownMinutes, InpT1FlattenMinutes);
+
+   ConfigureModule(1, "ZB/W03", InpT2S03Enabled, DIR_BUY,
+      InpT2S03StartHour, InpT2S03StartMinute, InpT2S03EndHour, InpT2S03EndMinute,
+      false, 0, 0, 0, 0,
+      InpT2S03MaxEntries, InpT2S03ScoreMin, InpT2S03TargetPoints, InpT2S03TargetMoneyPer001,
+      InpT2S03AtrTargetMult, InpT2S03MinLayerPoints, InpT2S03LayerAtrMult,
+      InpT2S03MinLayerSeconds, InpT2S03MaxAgeMinutes, InpT2S03MaxAdversePoints,
+      InpT2S03MaxLossMoney, InpT2S03CooldownMinutes, InpT2S03FlattenMinutes);
+
+   ConfigureModule(2, "ZC/W04", InpT2S04Enabled, DIR_BUY,
+      InpT2S04StartHour, InpT2S04StartMinute, InpT2S04EndHour, InpT2S04EndMinute,
+      false, 0, 0, 0, 0,
+      InpT2S04MaxEntries, InpT2S04ScoreMin, InpT2S04TargetPoints, InpT2S04TargetMoneyPer001,
+      InpT2S04AtrTargetMult, InpT2S04MinLayerPoints, InpT2S04LayerAtrMult,
+      InpT2S04MinLayerSeconds, InpT2S04MaxAgeMinutes, InpT2S04MaxAdversePoints,
+      InpT2S04MaxLossMoney, InpT2S04CooldownMinutes, InpT2S04FlattenMinutes);
+
+   ConfigureModule(3, "ZD/W09", InpT5Enabled, DIR_BUY,
+      InpT5StartHour, InpT5StartMinute, InpT5EndHour, InpT5EndMinute,
+      false, 0, 0, 0, 0,
+      InpT5MaxEntries, InpT5ScoreMin, InpT5TargetPoints, InpT5TargetMoneyPer001,
+      InpT5AtrTargetMult, InpT5MinLayerPoints, InpT5LayerAtrMult,
+      InpT5MinLayerSeconds, InpT5MaxAgeMinutes, InpT5MaxAdversePoints,
+      InpT5MaxLossMoney, InpT5CooldownMinutes, InpT5FlattenMinutes);
+
+   ConfigureModule(4, "ZE/W12", InpT6Enabled, DIR_SELL,
+      InpT6StartHour, InpT6StartMinute, InpT6EndHour, InpT6EndMinute,
+      false, 0, 0, 0, 0,
+      InpT6MaxEntries, InpT6ScoreMin, InpT6TargetPoints, InpT6TargetMoneyPer001,
+      InpT6AtrTargetMult, InpT6MinLayerPoints, InpT6LayerAtrMult,
+      InpT6MinLayerSeconds, InpT6MaxAgeMinutes, InpT6MaxAdversePoints,
+      InpT6MaxLossMoney, InpT6CooldownMinutes, InpT6FlattenMinutes);
+}
+
+//==========================================================================
+//  TIME UTILITIES
+//==========================================================================
+bool IsTradingWeekday(int dow)
+{
+   if(dow == 1) return InpTradeMonday;
+   if(dow == 2) return InpTradeTuesday;
+   if(dow == 3) return InpTradeWednesday;
+   if(dow == 4) return InpTradeThursday;
+   if(dow == 5) return InpTradeFriday;
+   return false;
+}
+
+double WeekdayBonus(int dow)
+{
+   if(dow == 2) return InpTuesdayScoreBonus;
+   if(dow == 4) return InpThursdayScoreBonus;
+   if(dow == 5) return InpFridayScoreBonus;
+   return 0.0;
+}
+
+int MinuteOfDay(datetime when)
+{
+   MqlDateTime dt;
+   TimeToStruct(when, dt);
+   return dt.hour * 60 + dt.min;
+}
+
+int WindowMinute(int hour, int minute)
+{
+   return MathMax(0, MathMin(23, hour)) * 60 + MathMax(0, MathMin(59, minute));
+}
+
+bool MinuteInWindow(int currentMinute, int startMinute, int endMinute)
+{
+   if(startMinute <= endMinute)
+      return (currentMinute >= startMinute && currentMinute <= endMinute);
+   return (currentMinute >= startMinute || currentMinute <= endMinute);
+}
+
+bool IsSessionActive(const ModuleConfig &cfg, datetime when)
+{
+   int cur = MinuteOfDay(when);
+   int s1  = WindowMinute(cfg.start1Hour, cfg.start1Minute);
+   int e1  = WindowMinute(cfg.end1Hour,   cfg.end1Minute);
+   if(MinuteInWindow(cur, s1, e1)) return true;
+   if(cfg.hasSecondSession)
+   {
+      int s2 = WindowMinute(cfg.start2Hour, cfg.start2Minute);
+      int e2 = WindowMinute(cfg.end2Hour,   cfg.end2Minute);
+      if(MinuteInWindow(cur, s2, e2)) return true;
+   }
+   return false;
+}
+
+int MinutesAfterEnd(int currentMinute, int endMinute)
+{
+   int diff = currentMinute - endMinute;
+   if(diff < 0) diff += 1440;
+   return diff;
+}
+
+bool ShouldSessionFlatten(const ModuleConfig &cfg, datetime when)
+{
+   if(!InpSessionEndFlatten) return false;
+   if(IsSessionActive(cfg, when)) return false;
+   int cur  = MinuteOfDay(when);
+   int e1   = WindowMinute(cfg.end1Hour, cfg.end1Minute);
+   int aft1 = MinutesAfterEnd(cur, e1);
+   if(aft1 > 0 && aft1 <= cfg.flattenMinutes) return true;
+   if(cfg.hasSecondSession)
+   {
+      int e2   = WindowMinute(cfg.end2Hour, cfg.end2Minute);
+      int aft2 = MinutesAfterEnd(cur, e2);
+      if(aft2 > 0 && aft2 <= cfg.flattenMinutes) return true;
+   }
+   return false;
+}
+
+bool IsXmasBlocked(datetime when)
+{
+   if(InpXmas <= 0) return false;
+   MqlDateTime dt;
+   TimeToStruct(when, dt);
+   return (dt.mon == 12 && dt.day >= 24 && dt.day <= 26);
+}
+
+string DirectionName(int direction)
+{
+   if(direction == DIR_BUY)  return "buy";
+   if(direction == DIR_SELL) return "sell";
+   return "none";
+}
+
+//==========================================================================
+//  SPREAD
+//==========================================================================
+double SpreadPoints()
+{
+   double bid = SymbolInfoDouble(g_symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(g_symbol, SYMBOL_ASK);
+   if(g_point <= 0.0 || bid <= 0.0 || ask <= 0.0) return 0.0;
+   return (ask - bid) / g_point;
+}
+
+bool SpreadAllowed(int idx)
+{
+   double spread = SpreadPoints();
+   if(spread <= InpSpread) return true;
+   datetime now = TimeCurrent();
+   if(now - g_modules[idx].lastSpreadLog >= 60)
+   {
+      g_modules[idx].lastSpreadLog = now;
+      PrintFormat("%s [%s] [%s] spread %.0f > max %d",
+                  EA_NAME, g_symbol, g_modules[idx].cfg.tag, spread, InpSpread);
+   }
+   return false;
+}
+
+//==========================================================================
+//  INDICATOR COPY HELPERS
+//==========================================================================
+bool CopyOne(int handle, int shift, double &value)
+{
+   if(handle == INVALID_HANDLE) return false;
+   double buf[1];
+   if(CopyBuffer(handle, 0, shift, 1, buf) != 1) return false;
+   value = buf[0];
+   return true;
+}
+
+bool CopyTwo(int handle, int shift, double &current, double &previous)
+{
+   if(handle == INVALID_HANDLE) return false;
+   double buf[2];
+   if(CopyBuffer(handle, 0, shift, 2, buf) != 2) return false;
+   current  = buf[0];
+   previous = buf[1];
+   return true;
+}
+
+double RecentRangePoints(MqlRates &rates[], int startIndex, int count)
+{
+   int total = ArraySize(rates);
+   if(total <= startIndex) return 0.0;
+   double hi = -DBL_MAX, lo = DBL_MAX;
+   int limit = MathMin(total, startIndex + count);
+   for(int i = startIndex; i < limit; i++)
+   {
+      hi = MathMax(hi, rates[i].high);
+      lo = MathMin(lo, rates[i].low);
+   }
+   if(hi <= -DBL_MAX/2.0 || lo >= DBL_MAX/2.0 || g_point <= 0.0) return 0.0;
+   return (hi - lo) / g_point;
+}
+
+//==========================================================================
+//  REGIME SNAPSHOT
+//==========================================================================
+bool UpdateRegime()
+{
+   ArraySetAsSeries(g_ratesM1,  true);
+   ArraySetAsSeries(g_ratesM5,  true);
+   ArraySetAsSeries(g_ratesM15, true);
+   ArraySetAsSeries(g_ratesH1,  true);
+
+   if(CopyRates(g_symbol, PERIOD_M1,  0, 64, g_ratesM1)  < 32) return false;
+   if(CopyRates(g_symbol, PERIOD_M5,  0, 64, g_ratesM5)  < 32) return false;
+   if(CopyRates(g_symbol, PERIOD_M15, 0, 64, g_ratesM15) < 32) return false;
+   if(CopyRates(g_symbol, PERIOD_H1,  0, 16, g_ratesH1)  < 8)  return false;
+
+   double atrM1 = 0, atrM5 = 0, atrM15 = 0;
+   double efM5 = 0, efM5p = 0, esM5 = 0;
+   double efM15 = 0, efM15p = 0, esM15 = 0, etH1 = 0;
+
+   if(!CopyOne(g_atrM1,     1, atrM1))   return false;
+   if(!CopyOne(g_atrM5,     1, atrM5))   return false;
+   if(!CopyOne(g_atrM15,    1, atrM15))  return false;
+   if(!CopyTwo(g_emaFastM5, 1, efM5, efM5p))   return false;
+   if(!CopyOne(g_emaSlowM5, 1, esM5))   return false;
+   if(!CopyTwo(g_emaFastM15,1, efM15, efM15p))  return false;
+   if(!CopyOne(g_emaSlowM15,1, esM15))  return false;
+   if(!CopyOne(g_emaTrendH1,1, etH1))   return false;
+
+   MqlRates c = g_ratesM1[1];
+   double body  = MathAbs(c.close - c.open);
+   double upper = c.high - MathMax(c.close, c.open);
+   double lower = MathMin(c.close, c.open) - c.low;
+   double range = c.high - c.low;
+
+   g_regime.ready          = true;
+   g_regime.m1BarTime      = g_ratesM1[0].time;
+   g_regime.atrM1          = atrM1;
+   g_regime.atrM5          = atrM5;
+   g_regime.atrM15         = atrM15;
+   g_regime.atrM1Points    = atrM1 / g_point;
+   g_regime.atrM5Points    = atrM5 / g_point;
+   g_regime.atrM15Points   = atrM15 / g_point;
+   g_regime.emaFastM5      = efM5;
+   g_regime.emaFastM5Prev  = efM5p;
+   g_regime.emaSlowM5      = esM5;
+   g_regime.emaFastM15     = efM15;
+   g_regime.emaFastM15Prev = efM15p;
+   g_regime.emaSlowM15     = esM15;
+   g_regime.emaTrendH1     = etH1;
+   g_regime.m1Open         = c.open;
+   g_regime.m1High         = c.high;
+   g_regime.m1Low          = c.low;
+   g_regime.m1Close        = c.close;
+   g_regime.m1BodyPoints   = body  / g_point;
+   g_regime.m1RangePoints  = range / g_point;
+   g_regime.upperWickPoints= upper / g_point;
+   g_regime.lowerWickPoints= lower / g_point;
+   g_regime.range6M1Points = RecentRangePoints(g_ratesM1, 1, 6);
+   g_regime.range20M1Points= RecentRangePoints(g_ratesM1, 1, 20);
+   g_regime.slopeM5Points  = (efM5 - efM5p)   / g_point;
+   g_regime.slopeM15Points = (efM15 - efM15p)  / g_point;
+   g_regime.bullishM1      = (c.close > c.open);
+   g_regime.bearishM1      = (c.close < c.open);
+   g_regime.compressionM1  = (g_regime.atrM1Points > 0.0 &&
+                               g_regime.range6M1Points < g_regime.atrM1Points * InpCompressionAtrFactor);
+   g_regime.expansionM1    = (g_regime.atrM1Points > 0.0 &&
+                               g_regime.m1RangePoints > g_regime.atrM1Points * InpExpansionAtrFactor);
+   return true;
+}
+
+bool AtrAllowed(const RegimeSnapshot &r)
+{
+   if(!r.ready) return false;
+   if(r.atrM1Points < InpMinAtrM1Points) return false;
+   if(r.atrM1Points > InpMaxAtrM1Points) return false;
+   return true;
+}
+
+//==========================================================================
+//  SIGNAL ENGINE
+//==========================================================================
+void AddReason(string &reason, string text)
+{
+   if(StringLen(reason) > 0) reason += "; ";
+   reason += text;
+}
+
+void ClearSignal(SignalInfo &sig)
+{
+   sig.valid     = false;
+   sig.direction = DIR_NONE;
+   sig.score     = 0.0;
+   sig.reason    = "";
+}
+
+bool T5Cadence(datetime when)
+{
+   if(InpT5CadenceMinutes <= 0) return true;
+   MqlDateTime dt;
+   TimeToStruct(when, dt);
+   int mod = dt.min % InpT5CadenceMinutes;
+   return (mod <= InpT5CadenceToleranceMinutes ||
+           mod >= InpT5CadenceMinutes - InpT5CadenceToleranceMinutes);
+}
+
+void BuildSignal(int idx, const RegimeSnapshot &r, SignalInfo &sig)
+{
+   ClearSignal(sig);
+   ModuleConfig cfg = g_modules[idx].cfg;
+   datetime now = TimeCurrent();
+   MqlDateTime dt;
+   TimeToStruct(now, dt);
+
+   if(!cfg.enabled) return;
+   if(IsXmasBlocked(now)) return;
+   if(!IsTradingWeekday(dt.day_of_week)) return;
+   if(!IsSessionActive(cfg, now)) return;
+   if(!AtrAllowed(r)) return;
+   if(!SpreadAllowed(idx)) return;
+   if(now < g_modules[idx].cooldownUntil) return;
+
+   double score  = 1.0 + WeekdayBonus(dt.day_of_week);
+   string reason = "session";
+
+   if(idx == 0) // ZA/W01 — late session BUY micro mean-reversion
+   {
+      if(r.lowerWickPoints > MathMax(8.0, r.m1BodyPoints * InpWickBodyFactor))
+      { score += 1.15; AddReason(reason, "lower wick rejection"); }
+      if((r.emaFastM5 - r.m1Close) / g_point > r.atrM1Points * InpPullbackAtrFactor)
+      { score += 1.10; AddReason(reason, "late pullback below M5 EMA"); }
+      if(r.compressionM1)
+      { score += 0.85; AddReason(reason, "M1 range compression"); }
+      if(r.slopeM5Points > -InpMaxBearSlopeForBuyPoints)
+      { score += 0.75; AddReason(reason, "M5 slope stable"); }
+      if(r.bullishM1 && r.m1Close > (r.m1Low + (r.m1High - r.m1Low) * 0.55))
+      { score += 0.75; AddReason(reason, "micro recovery close"); }
+      if(dt.hour == 23 || dt.hour == 1)
+         score += 0.40;
+   }
+   else if(idx == 1) // ZB/W03 — late US BUY hybrid
+   {
+      if(r.slopeM5Points > -40.0)
+      { score += 0.85; AddReason(reason, "hybrid M5 slope"); }
+      if(r.bullishM1 && r.expansionM1)
+      { score += 1.05; AddReason(reason, "bullish expansion"); }
+      if((r.emaFastM5 - r.m1Close) / g_point > r.atrM1Points * 0.10 &&
+         r.lowerWickPoints > r.m1BodyPoints * 0.70)
+      { score += 1.10; AddReason(reason, "pullback rejection"); }
+      if(r.m1Close > r.emaSlowM5 || r.slopeM15Points > -80.0)
+      { score += 0.80; AddReason(reason, "late US constructive regime"); }
+      if(r.compressionM1) score += 0.45;
+   }
+   else if(idx == 2) // ZC/W04 — early NY BUY impulse/pullback
+   {
+      if(r.slopeM5Points > 0.0)
+      { score += 1.05; AddReason(reason, "early NY positive M5 slope"); }
+      if(r.m1Close > r.emaFastM5)
+      { score += 0.85; AddReason(reason, "close above M5 EMA"); }
+      if(r.bullishM1 && (r.expansionM1 || r.lowerWickPoints > r.m1BodyPoints * 0.60))
+      { score += 1.10; AddReason(reason, "impulse pullback buy"); }
+      if(r.slopeM15Points > -70.0)
+      { score += 0.65; AddReason(reason, "M15 not hostile"); }
+   }
+   else if(idx == 3) // ZD/W09 — late morning BUY cadence scalp
+   {
+      if(InpT5ThuFriBiasOnly && !(dt.day_of_week == 4 || dt.day_of_week == 5))
+         return;
+      if(T5Cadence(now))
+      { score += 0.95; AddReason(reason, "late morning cadence"); }
+      if(r.compressionM1 || r.range20M1Points < r.atrM1Points * 4.5)
+      { score += 0.85; AddReason(reason, "opportunistic compression"); }
+      if(r.bullishM1 || r.lowerWickPoints > r.m1BodyPoints * 0.80)
+      { score += 0.90; AddReason(reason, "short-hold buy structure"); }
+      if(MathAbs(r.slopeM5Points) < 140.0 || r.slopeM5Points > 0.0)
+      { score += 0.60; AddReason(reason, "moderate late morning regime"); }
+   }
+   else if(idx == 4) // ZE/W12 — London morning SELL reversal
+   {
+      if((dt.day_of_week == 3 || dt.day_of_week == 5) && InpT6WeakDayPenalty > 0.0)
+      { score -= InpT6WeakDayPenalty; AddReason(reason, "T6 weak-day filter"); }
+      if(r.upperWickPoints > MathMax(8.0, r.m1BodyPoints * InpWickBodyFactor))
+      { score += 1.15; AddReason(reason, "upper wick exhaustion"); }
+      if((r.m1Close - r.emaFastM5) / g_point > r.atrM1Points * InpPullbackAtrFactor)
+      { score += 1.00; AddReason(reason, "price stretched above M5 EMA"); }
+      if(r.slopeM5Points < InpMaxBullSlopeForSellPoints)
+      { score += 0.80; AddReason(reason, "London slope sellable"); }
+      if(r.bearishM1 && (r.expansionM1 ||
+         r.m1Close < (r.m1High - (r.m1High - r.m1Low) * 0.55)))
+      { score += 1.05; AddReason(reason, "bearish reversal candle"); }
+      if(r.slopeM15Points < 120.0) score += 0.45;
+   }
+
+   sig.score     = score;
+   sig.direction = cfg.direction;
+   sig.reason    = reason;
+   sig.valid     = (score >= cfg.scoreMin);
+}
+
+//==========================================================================
+//  LOT SIZING
+//==========================================================================
+double NormalizeVolume(double volume)
+{
+   double minVol  = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MIN);
+   double maxVol  = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MAX);
+   double step    = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0.0) step = 0.01;
+   double normalized = MathFloor(volume / step + 0.0000001) * step;
+   normalized = MathMax(minVol, MathMin(maxVol, normalized));
+   return NormalizeDouble(normalized, 2);
+}
+
+double CalculateLot()
+{
+   double lot = InpLotsFixed;
+   if(InpLotsCalc == 0) // balance-step (primary)
+   {
+      double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+      double blockBal  = MathMax(1.0, InpLotsFixedBalance);
+      int    blocks    = (int)MathFloor(balance / blockBal);
+      if(blocks < 1) blocks = 1;
+      if(InpAutoLotsValue > 0) blocks = MathMin(blocks, InpAutoLotsValue);
+      lot = InpLotsFixed * blocks;
+   }
+   else if(InpLotsCalc == 2)
+   {
+      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      double blocks  = MathMax(1.0, balance / MathMax(1.0, InpLotsFixedBalance));
+      lot = InpLotsFixed * MathMin(blocks, MathMax(1, InpAutoLotsValue));
+   }
+   return NormalizeVolume(lot);
+}
+
+//==========================================================================
+//  ORDER COMMENT / PARSING
+//==========================================================================
+string OrderComment(string tag, int basketId)
+{
+   return StringFormat("ZGM[%s]%I64d[%s]#B%d", g_symbol, InpMagicNumber, tag, basketId);
+}
+
+int ParseBasketId(string comment)
+{
+   int pos = StringFind(comment, "#B");
+   if(pos < 0) return 0;
+   return (int)StringToInteger(StringSubstr(comment, pos + 2));
+}
+
+bool CommentMatchesTag(string comment, string tag)
+{
+   return (StringFind(comment, "[" + tag + "]") >= 0);
+}
+
+//==========================================================================
+//  CSV / LOGGING
+//==========================================================================
+void CsvLog(string eventName, string tag, int basketId, string detail, double v1, double v2)
+{
+   if(g_csvHandle == INVALID_HANDLE) return;
+   FileWrite(g_csvHandle,
+      TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS),
+      g_symbol, tag, basketId, eventName,
+      DoubleToString(v1,2), DoubleToString(v2,2), detail);
+   FileFlush(g_csvHandle);
+}
+
+void LogEvent(string tag, string detail)
+{
+   PrintFormat("%s [%s] [%s] %s", EA_NAME, g_symbol, tag, detail);
+   CsvLog("event", tag, 0, detail,
+          AccountInfoDouble(ACCOUNT_BALANCE), AccountInfoDouble(ACCOUNT_EQUITY));
+}
+
+void LogCloseLine(string tag, int closedTrades)
+{
+   PrintFormat("%s [%s] [%s] %d %s closed. Balance: %.2f %s Equity: %.2f %s",
+      EA_NAME, g_symbol, tag, closedTrades,
+      (closedTrades == 1 ? "trade" : "trades"),
+      AccountInfoDouble(ACCOUNT_BALANCE), AccountInfoString(ACCOUNT_CURRENCY),
+      AccountInfoDouble(ACCOUNT_EQUITY),  AccountInfoString(ACCOUNT_CURRENCY));
+}
+
+//==========================================================================
+//  BASKET AGGREGATION — RefreshBaskets
+//==========================================================================
+void AddPositionToBasket(BasketState &basket)
+{
+   string comment  = PositionGetString(POSITION_COMMENT);
+   int    posType  = (int)PositionGetInteger(POSITION_TYPE);
+   int    dir      = (posType == POSITION_TYPE_BUY ? DIR_BUY : DIR_SELL);
+   double volume   = PositionGetDouble(POSITION_VOLUME);
+   double priceOp  = PositionGetDouble(POSITION_PRICE_OPEN);
+   datetime opTime = (datetime)PositionGetInteger(POSITION_TIME);
+   double profit   = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+   int parsedId    = ParseBasketId(comment);
+
+   if(!basket.active)
+   {
+      basket.active          = true;
+      basket.id              = parsedId;
+      basket.direction       = dir;
+      basket.firstEntryTime  = opTime;
+      basket.lastEntryTime   = opTime;
+      basket.lastEntryPrice  = priceOp;
+      basket.entries         = 0;
+      basket.totalLots       = 0.0;
+      basket.weightedAvgPrice= 0.0;
+      basket.floatingProfit  = 0.0;
+   }
+   if(basket.id == 0 && parsedId > 0) basket.id = parsedId;
+   if(opTime < basket.firstEntryTime || basket.firstEntryTime == 0) basket.firstEntryTime = opTime;
+   if(opTime >= basket.lastEntryTime)
+   { basket.lastEntryTime = opTime; basket.lastEntryPrice = priceOp; }
+
+   basket.entries++;
+   basket.weightedAvgPrice += priceOp * volume;
+   basket.totalLots        += volume;
+   basket.floatingProfit   += profit;
+   basket.direction         = dir;
+}
+
+double CurrentBasketExitPrice(int direction)
+{
+   if(direction == DIR_BUY)  return SymbolInfoDouble(g_symbol, SYMBOL_BID);
+   if(direction == DIR_SELL) return SymbolInfoDouble(g_symbol, SYMBOL_ASK);
+   return 0.0;
+}
+
+void RefreshBaskets()
+{
+   BasketState collected[MODULE_COUNT];
+   for(int i = 0; i < MODULE_COUNT; i++)
+   {
+      ResetBasket(collected[i]);
+      collected[i].moduleTag = g_modules[i].cfg.tag;
+   }
+
+   for(int p = PositionsTotal()-1; p >= 0; p--)
+   {
+      ulong ticket = PositionGetTicket(p);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != g_symbol) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      string cmt = PositionGetString(POSITION_COMMENT);
+      int idx = -1;
+      for(int i = 0; i < MODULE_COUNT; i++)
+         if(CommentMatchesTag(cmt, g_modules[i].cfg.tag)) { idx = i; break; }
+      if(idx < 0) continue;
+      AddPositionToBasket(collected[idx]);
+   }
+
+   for(int i = 0; i < MODULE_COUNT; i++)
+   {
+      if(collected[i].active && collected[i].totalLots > 0.0)
+      {
+         collected[i].weightedAvgPrice /= collected[i].totalLots;
+         if(collected[i].id <= 0)
+            collected[i].id = (g_modules[i].basket.active && g_modules[i].basket.id > 0)
+                               ? g_modules[i].basket.id : g_nextBasketId++;
+
+         double cp = CurrentBasketExitPrice(collected[i].direction);
+         double excursion = 0.0;
+         if(collected[i].direction == DIR_BUY)
+            excursion = (cp - collected[i].weightedAvgPrice) / g_point;
+         else if(collected[i].direction == DIR_SELL)
+            excursion = (collected[i].weightedAvgPrice - cp) / g_point;
+
+         if(g_modules[i].basket.active && g_modules[i].basket.id == collected[i].id)
+         {
+            collected[i].mfe = MathMax(g_modules[i].basket.mfe, collected[i].floatingProfit);
+            collected[i].mae = MathMin(g_modules[i].basket.mae, collected[i].floatingProfit);
+            collected[i].maxExcursionPoints = MathMax(g_modules[i].basket.maxExcursionPoints, MathAbs(excursion));
+         }
+         else
+         {
+            collected[i].mfe = MathMax(0.0, collected[i].floatingProfit);
+            collected[i].mae = MathMin(0.0, collected[i].floatingProfit);
+            collected[i].maxExcursionPoints = MathAbs(excursion);
+         }
+         g_modules[i].basket = collected[i];
+      }
+      else
+      {
+         ResetBasket(g_modules[i].basket);
+         g_modules[i].basket.moduleTag = g_modules[i].cfg.tag;
+      }
+   }
+}
+
+//==========================================================================
+//  AGGREGATE BASKET METRICS
+//==========================================================================
+int OpenBasketCount()
+{
+   int count = 0;
+   for(int i = 0; i < MODULE_COUNT; i++)
+      if(g_modules[i].basket.active) count++;
+   return count;
+}
+
+double TotalOpenLots()
+{
+   double lots = 0.0;
+   for(int i = 0; i < MODULE_COUNT; i++)
+      lots += g_modules[i].basket.totalLots;
+   return lots;
+}
+
+double TotalFloatingProfit()
+{
+   double profit = 0.0;
+   for(int i = 0; i < MODULE_COUNT; i++)
+      profit += g_modules[i].basket.floatingProfit;
+   return profit;
+}
+
+double DirectionalOpenLots(int direction)
+{
+   double lots = 0.0;
+   for(int i = 0; i < MODULE_COUNT; i++)
+      if(g_modules[i].basket.active && g_modules[i].basket.direction == direction)
+         lots += g_modules[i].basket.totalLots;
+   return lots;
+}
+
+//==========================================================================
+//  EQUITY PROTECTION
+//==========================================================================
+bool EquityProtectionPauseActive()
+{
+   return (g_equityProtectionPauseUntil > 0 && TimeCurrent() < g_equityProtectionPauseUntil);
+}
+
+bool EquityProtectionAllowsNewBasket(int idx)
+{
+   if(!EquityProtectionPauseActive()) return true;
+   if(!InpAllowEquityProtectionHedge) return false;
+   int dir = g_modules[idx].cfg.direction;
+   if(dir == DIR_SELL && DirectionalOpenLots(DIR_BUY)  > DirectionalOpenLots(DIR_SELL)) return true;
+   if(dir == DIR_BUY  && DirectionalOpenLots(DIR_SELL) > DirectionalOpenLots(DIR_BUY))  return true;
+   return false;
+}
+
+bool EquityProtectionHedgeBasket(int idx)
+{
+   return (EquityProtectionPauseActive() && EquityProtectionAllowsNewBasket(idx));
+}
+
+void PauseEntriesForEquityProtection(string detail)
+{
+   int pauseSec = MathMax(1, InpForcedCooldownMinutes) * 60;
+   datetime until = TimeCurrent() + pauseSec;
+   if(until > g_equityProtectionPauseUntil) g_equityProtectionPauseUntil = until;
+   if(TimeCurrent() - g_lastEquityProtectionLog >= 300)
+   {
+      g_lastEquityProtectionLog = TimeCurrent();
+      LogEvent("CORE", StringFormat("equity protection active until %s: %s",
+         TimeToString(g_equityProtectionPauseUntil, TIME_DATE|TIME_MINUTES), detail));
+   }
+}
+
+//==========================================================================
+//  EXIT / ESCAPE LOGIC
+//==========================================================================
+double TargetBufferPoints(const ModuleConfig &cfg, const RegimeSnapshot &r)
+{
+   return MathMax(cfg.targetPoints, r.atrM1Points * cfg.atrTargetMult);
+}
+
+double TargetMoney(const ModuleConfig &cfg, const BasketState &basket)
+{
+   if(basket.totalLots <= 0.0) return cfg.targetMoneyPer001;
+   return cfg.targetMoneyPer001 * (basket.totalLots / 0.01);
+}
+
+double BasketFavorablePoints(const BasketState &basket)
+{
+   double price = CurrentBasketExitPrice(basket.direction);
+   if(price <= 0.0 || basket.weightedAvgPrice <= 0.0) return 0.0;
+   if(basket.direction == DIR_BUY)  return (price - basket.weightedAvgPrice) / g_point;
+   if(basket.direction == DIR_SELL) return (basket.weightedAvgPrice - price) / g_point;
+   return 0.0;
+}
+
+double BasketAdversePoints(const BasketState &basket)
+{
+   double fav = BasketFavorablePoints(basket);
+   return (fav < 0.0) ? -fav : 0.0;
+}
+
+bool FavorableImpulse(int direction, const RegimeSnapshot &r)
+{
+   if(!r.expansionM1 && r.m1RangePoints < r.atrM1Points * InpFastCloseAtrMultiplier) return false;
+   if(direction == DIR_BUY)
+      return (r.bullishM1 && r.m1Close > r.m1Low + (r.m1High - r.m1Low) * 0.65);
+   if(direction == DIR_SELL)
+      return (r.bearishM1 && r.m1Close < r.m1High - (r.m1High - r.m1Low) * 0.65);
+   return false;
+}
+
+double BasketSafeLossLimit(const BasketState &basket)
+{
+   double lots = MathMax(0.01, basket.totalLots);
+   return MathMax(0.0, InpSafeExitMaxLossPer001) * lots / 0.01;
+}
+
+bool SafeToForceCloseBasket(const BasketState &basket, double favorable, string &detail)
+{
+   detail = "";
+   if(!InpUseSafeBasketExit) { detail = "safe exit disabled"; return true; }
+   if(basket.floatingProfit >= InpSafeExitMinProfitMoney)
+   { detail = StringFormat("safe profit %.2f", basket.floatingProfit); return true; }
+   double lossLim = BasketSafeLossLimit(basket);
+   if(basket.floatingProfit >= -lossLim && favorable >= -InpSafeExitNearAveragePoints)
+   { detail = StringFormat("near-avg controlled exit pl=%.2f fav=%.1f", basket.floatingProfit, favorable); return true; }
+   detail = StringFormat("held for recovery pl=%.2f lim=%.2f fav=%.1f", basket.floatingProfit, lossLim, favorable);
+   return false;
+}
+
+bool DdEscapeTriggered(string &detail)
+{
+   detail = "";
+   if(InpDDMode <= 0 || InpDDValue <= 0.0) return false;
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   double eq  = AccountInfoDouble(ACCOUNT_EQUITY);
+   double dd  = bal - eq;
+   if(dd <= 0.0) return false;
+   if(InpDDMode == 1)
+   {
+      double pct = (bal > 0.0 ? dd / bal * 100.0 : 0.0);
+      if(pct >= InpDDValue) { detail = StringFormat("DD %.2f%% >= %.2f%%", pct, InpDDValue); return true; }
+   }
+   else if(InpDDMode == 2)
+   {
+      if(dd >= InpDDValue) { detail = StringFormat("DD %.2f >= %.2f", dd, InpDDValue); return true; }
+   }
+   return false;
+}
+
+bool EquityProtectionTriggered(string &detail)
+{
+   detail = "";
+   if(!InpUseEquityProtection) return false;
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   double eq  = AccountInfoDouble(ACCOUNT_EQUITY);
+   double dd  = bal - eq;
+   if(dd <= 0.0) return false;
+   if(InpEquityProtectionMoney > 0.0 && dd >= InpEquityProtectionMoney)
+   { detail = StringFormat("equity DD %.2f >= %.2f", dd, InpEquityProtectionMoney); return true; }
+   if(InpEquityProtectionPercent > 0.0 && bal > 0.0)
+   {
+      double pct = dd / bal * 100.0;
+      if(pct >= InpEquityProtectionPercent)
+      { detail = StringFormat("equity DD %.2f%% >= %.2f%%", pct, InpEquityProtectionPercent); return true; }
+   }
+   return false;
+}
+
+//==========================================================================
+//  CLOSE BASKET
+//==========================================================================
+bool ClosePositionTicket(ulong ticket)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+   bool result = trade.PositionClose(ticket, InpSlippage);
+   if(!result)
+      PrintFormat("%s [%s] close failed ticket=%I64u ret=%d %s",
+                  EA_NAME, g_symbol, ticket, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+   return result;
+}
+
+int CloseBasket(int idx, ENUM_ZGM_CLOSE_REASON reason, string detail, bool forced)
+{
+   RefreshBaskets();
+   BasketState basket  = g_modules[idx].basket;
+   if(!basket.active) return 0;
+
+   double preProfit    = basket.floatingProfit;
+   int    preEntries   = basket.entries;
+   datetime now        = TimeCurrent();
+   long holdSeconds    = (long)(now - basket.firstEntryTime);
+   int  closed         = 0;
+   string tag          = g_modules[idx].cfg.tag;
+   int    ri           = (int)reason;
+   if(ri < 0 || ri >= CR_COUNT) ri = 0;
+
+   for(int p = PositionsTotal()-1; p >= 0; p--)
+   {
+      ulong ticket = PositionGetTicket(p);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != g_symbol) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      if(!CommentMatchesTag(PositionGetString(POSITION_COMMENT), tag)) continue;
+      if(ClosePositionTicket(ticket)) closed++;
+   }
+
+   if(closed == 0)
+   {
+      // Market closed or connectivity issue — debounce 60 s to avoid log spam on every timer tick
+      g_modules[idx].retryCloseAfter = TimeCurrent() + 60;
+      return 0;
+   }
+
+   if(closed > 0)
+   {
+      LogEvent(tag, StringFormat("basket close reason=%s id=%d entries=%d floating=%.2f detail=%s",
+         g_reasonNames[ri], basket.id, basket.entries, basket.floatingProfit, detail));
+      CsvLog("basket_close_start", tag, basket.id, detail, preProfit, basket.totalLots);
+      g_modules[idx].stats.basketCount++;
+      g_modules[idx].stats.tradeCount    += closed;
+      g_modules[idx].stats.entrySum      += preEntries;
+      g_modules[idx].stats.holdSecondsSum+= holdSeconds;
+      g_modules[idx].stats.profitSum     += preProfit;
+      g_modules[idx].stats.mfeSum        += basket.mfe;
+      g_modules[idx].stats.maeSum        += basket.mae;
+      g_modules[idx].stats.maxExcursionSum += basket.maxExcursionPoints;
+      if(preProfit >= 0.0) g_modules[idx].stats.winCount++;
+      else                 g_modules[idx].stats.lossCount++;
+
+      g_modules[idx].retryCloseAfter = 0;   // close succeeded — clear debounce
+      g_reasonCounts[ri]++;
+      int coolSec = (forced ? InpForcedCooldownMinutes : g_modules[idx].cfg.cooldownMinutes) * 60;
+      g_modules[idx].cooldownUntil = now + coolSec;
+
+      LogCloseLine(tag, closed);
+      CsvLog("basket_closed", tag, basket.id, g_reasonNames[ri], preProfit, AccountInfoDouble(ACCOUNT_BALANCE));
+   }
+   RefreshBaskets();
+   return closed;
+}
+
+void CloseAllBaskets(ENUM_ZGM_CLOSE_REASON reason, string detail, bool forced)
+{
+   for(int i = 0; i < MODULE_COUNT; i++)
+      if(g_modules[i].basket.active) CloseBasket(i, reason, detail, forced);
+}
+
+//==========================================================================
+//  RISK MANAGEMENT & EXITS
+//==========================================================================
+void ManageRiskAndExits()
+{
+   RefreshBaskets();
+
+   string ddDetail = "";
+   if(DdEscapeTriggered(ddDetail)) { CloseAllBaskets(CR_DD_MODE, ddDetail, true); return; }
+
+   double globalFL = TotalFloatingProfit();
+   if(InpMaxGlobalFloatingLossMoney > 0.0 && globalFL <= -InpMaxGlobalFloatingLossMoney)
+   {
+      CloseAllBaskets(CR_GLOBAL_LOSS,
+         StringFormat("global floating %.2f <= -%.2f", globalFL, InpMaxGlobalFloatingLossMoney), true);
+      return;
+   }
+
+   string eqDetail = "";
+   if(EquityProtectionTriggered(eqDetail))
+   {
+      if(InpEquityProtectionCloseBaskets) { CloseAllBaskets(CR_EQUITY_PROTECTION, eqDetail, true); return; }
+      PauseEntriesForEquityProtection(eqDetail);
+   }
+
+   for(int i = 0; i < MODULE_COUNT; i++)
+   {
+      BasketState basket = g_modules[i].basket;
+      if(!basket.active) continue;
+      if(TimeCurrent() < g_modules[i].retryCloseAfter) continue;  // debounce failed close
+      ModuleConfig cfg   = g_modules[i].cfg;
+      double favorable   = BasketFavorablePoints(basket);
+      double adverse     = BasketAdversePoints(basket);
+      double buffer      = TargetBufferPoints(cfg, g_regime);
+      double moneyTgt    = TargetMoney(cfg, basket);
+      long   ageMins     = (long)((TimeCurrent() - basket.firstEntryTime) / 60);
+
+      if(cfg.maxLossMoney > 0.0 && basket.floatingProfit <= -cfg.maxLossMoney)
+      {
+         CloseBasket(i, CR_BASKET_LOSS,
+            StringFormat("basket pl %.2f <= -%.2f", basket.floatingProfit, cfg.maxLossMoney), true);
+         continue;
+      }
+      if(cfg.maxAdversePoints > 0.0 && adverse >= cfg.maxAdversePoints)
+      {
+         string sd = "";
+         if(SafeToForceCloseBasket(basket, favorable, sd))
+         { CloseBasket(i, CR_ADVERSE_POINTS, StringFormat("adverse %.1f pts >= %.1f; %s", adverse, cfg.maxAdversePoints, sd), true); continue; }
+      }
+      if(cfg.maxAgeMinutes > 0 && ageMins >= cfg.maxAgeMinutes)
+      {
+         string sd = "";
+         if(SafeToForceCloseBasket(basket, favorable, sd))
+         { CloseBasket(i, CR_SAFE_RECOVERY, StringFormat("age %d min >= %d; %s", (int)ageMins, cfg.maxAgeMinutes, sd), false); continue; }
+      }
+      if(ShouldSessionFlatten(cfg, TimeCurrent()))
+      {
+         string sd = "";
+         if(SafeToForceCloseBasket(basket, favorable, sd))
+         { CloseBasket(i, CR_SESSION_END, StringFormat("session-end flatten; %s", sd), false); continue; }
+      }
+      if(basket.floatingProfit >= moneyTgt)
+      { CloseBasket(i, CR_MONEY_TARGET, StringFormat("profit %.2f >= target %.2f", basket.floatingProfit, moneyTgt), false); continue; }
+      if(favorable >= buffer)
+      {
+         string sd = "";
+         if(SafeToForceCloseBasket(basket, favorable, sd))
+         { CloseBasket(i, CR_PRICE_BUFFER, StringFormat("favorable %.1f >= buffer %.1f; %s", favorable, buffer, sd), false); continue; }
+      }
+      if(basket.floatingProfit >= InpFastCloseMinProfitMoney && FavorableImpulse(basket.direction, g_regime))
+      { CloseBasket(i, CR_FAST_IMPULSE, StringFormat("favorable impulse pl=%.2f", basket.floatingProfit), false); continue; }
+   }
+}
+
+//==========================================================================
+//  ENTRY ENGINE
+//==========================================================================
+bool TradeStops(int direction, double &sl, double &tp)
+{
+   sl = 0.0; tp = 0.0;
+   if(!InpUseSafetyStops) return true;
+   double ask = SymbolInfoDouble(g_symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(g_symbol, SYMBOL_BID);
+   if(direction == DIR_BUY)
+   {
+      if(InpSafetySLPoints > 0.0) sl = NormalizeDouble(ask - InpSafetySLPoints * g_point, g_digits);
+      if(InpSafetyTPPoints > 0.0) tp = NormalizeDouble(ask + InpSafetyTPPoints * g_point, g_digits);
+   }
+   else if(direction == DIR_SELL)
+   {
+      if(InpSafetySLPoints > 0.0) sl = NormalizeDouble(bid + InpSafetySLPoints * g_point, g_digits);
+      if(InpSafetyTPPoints > 0.0) tp = NormalizeDouble(bid - InpSafetyTPPoints * g_point, g_digits);
+   }
+   return true;
+}
+
+bool ExecuteEntry(int idx, int basketId, string entryKind, string reason)
+{
+   ModuleConfig cfg = g_modules[idx].cfg;
+   double lot = CalculateLot();
+   double sl = 0.0, tp = 0.0;
+   TradeStops(cfg.direction, sl, tp);
+   string cmt = OrderComment(cfg.tag, basketId);
+
+   bool ok = false;
+   if(cfg.direction == DIR_BUY)  ok = trade.Buy(lot,  g_symbol, 0.0, sl, tp, cmt);
+   else if(cfg.direction == DIR_SELL) ok = trade.Sell(lot, g_symbol, 0.0, sl, tp, cmt);
+
+   if(ok)
+   {
+      g_modules[idx].lastEntryBar     = g_regime.m1BarTime;
+      g_modules[idx].lastSignalReason = reason;
+      LogEvent(cfg.tag, StringFormat("%s %s lot=%.2f basket=%d reason=%s",
+         entryKind, DirectionName(cfg.direction), lot, basketId, reason));
+      CsvLog(entryKind, cfg.tag, basketId, reason, lot, SpreadPoints());
+      return true;
+   }
+   PrintFormat("%s [%s] [%s] entry failed kind=%s ret=%d %s",
+      EA_NAME, g_symbol, cfg.tag, entryKind, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+   return false;
+}
+
+bool CanOpenNewBasket(int idx)
+{
+   bool hedge = EquityProtectionHedgeBasket(idx);
+   if(EquityProtectionPauseActive() && !hedge) return false;
+   if(OpenBasketCount() >= InpMaxGlobalBaskets &&
+      !(hedge && InpEquityProtectionHedgeBypassMaxBaskets)) return false;
+   if(TimeCurrent() < g_modules[idx].cooldownUntil) return false;
+   if(g_modules[idx].lastEntryBar == g_regime.m1BarTime) return false;
+   if(InpBlockFridayNightEntry && !hedge)
+   {
+      MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+      if(dt.day_of_week == 5 && dt.hour >= 22) return false;  // Friday 22:00+: no new baskets before weekend
+   }
+   return true;
+}
+
+bool ShouldLayer(int idx, SignalInfo &sig, string &layerReason)
+{
+   layerReason = "";
+   BasketState basket = g_modules[idx].basket;
+   ModuleConfig cfg   = g_modules[idx].cfg;
+   if(!basket.active) return false;
+   bool hedgeLayer = (EquityProtectionPauseActive() && InpAllowEquityProtectionHedge &&
+      ((basket.direction == DIR_SELL && DirectionalOpenLots(DIR_BUY)  > DirectionalOpenLots(DIR_SELL)) ||
+       (basket.direction == DIR_BUY  && DirectionalOpenLots(DIR_SELL) > DirectionalOpenLots(DIR_BUY))));
+   if(EquityProtectionPauseActive() && !hedgeLayer) return false;
+   if(basket.entries >= cfg.maxEntries) return false;
+   if(g_modules[idx].lastEntryBar == g_regime.m1BarTime) return false;
+   if(TimeCurrent() - basket.lastEntryTime < cfg.minLayerSeconds) return false;
+   if(InpLayerOnlyInsideSession && !IsSessionActive(cfg, TimeCurrent())) return false;
+   if(!SpreadAllowed(idx)) return false;
+
+   double spacing = MathMax(cfg.minLayerPoints, g_regime.atrM1Points * cfg.layerAtrMult);
+   double bid = SymbolInfoDouble(g_symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(g_symbol, SYMBOL_ASK);
+
+   if(basket.direction == DIR_BUY)
+   {
+      double adverse = (basket.lastEntryPrice - ask) / g_point;
+      if(adverse >= spacing)
+      { layerReason = StringFormat("adverse recovery %.1f >= spacing %.1f", adverse, spacing); return true; }
+      if(InpAllowContinuationLayer && sig.valid && basket.entries < cfg.maxEntries)
+      {
+         double favMove = (bid - basket.lastEntryPrice) / g_point;
+         if(favMove >= spacing * InpContinuationLayerFraction &&
+            g_regime.lowerWickPoints > g_regime.m1BodyPoints * 0.60)
+         { layerReason = StringFormat("buy continuation %.1f", favMove); return true; }
+      }
+   }
+   else if(basket.direction == DIR_SELL)
+   {
+      double adverse = (bid - basket.lastEntryPrice) / g_point;
+      if(adverse >= spacing)
+      { layerReason = StringFormat("adverse sell recovery %.1f >= spacing %.1f", adverse, spacing); return true; }
+      if(InpAllowContinuationLayer && sig.valid && basket.entries < cfg.maxEntries)
+      {
+         double favMove = (basket.lastEntryPrice - ask) / g_point;
+         if(favMove >= spacing * InpContinuationLayerFraction &&
+            g_regime.upperWickPoints > g_regime.m1BodyPoints * 0.60)
+         { layerReason = StringFormat("sell continuation %.1f", favMove); return true; }
+      }
+   }
+   return false;
+}
+
+void ProcessEntryEngine()
+{
+   if(g_paused) return;   // EA paused via panel button
+   SignalInfo signals[MODULE_COUNT];
+   int    bestIdx   = -1;
+   double bestScore = -1.0;
+
+   for(int i = 0; i < MODULE_COUNT; i++)
+   {
+      BuildSignal(i, g_regime, signals[i]);
+      if(signals[i].score > bestScore) { bestScore = signals[i].score; bestIdx = i; }
+   }
+
+   string newActive = (bestIdx >= 0 && bestScore > 0.0) ? g_modules[bestIdx].cfg.tag : "None";
+   if(newActive != g_activeModule)
+   {
+      g_activeModule = newActive;
+      if(bestIdx >= 0 && bestScore > 0.0)
+         LogEvent(g_modules[bestIdx].cfg.tag,
+            StringFormat("active module chosen score=%.2f reason=%s", bestScore, signals[bestIdx].reason));
+   }
+
+   int openedThisBar = 0;
+   for(int i = 0; i < MODULE_COUNT; i++)
+   {
+      if(openedThisBar >= InpMaxNewEntriesPerBar) break;
+      if(g_modules[i].basket.active)
+      {
+         string lr = "";
+         if(ShouldLayer(i, signals[i], lr))
+            if(ExecuteEntry(i, g_modules[i].basket.id, "additional layered entry", lr)) openedThisBar++;
+      }
+      else
+      {
+         bool isHedge = EquityProtectionHedgeBasket(i);
+         // Allow hedge entry even when signals[i].valid=false (outside session / below score).
+         // The hedge direction comes from cfg.direction; signal validity is irrelevant for emergency hedges.
+         if((signals[i].valid || isHedge) && CanOpenNewBasket(i))
+         {
+            int bid2 = g_nextBasketId++;
+            string eKind  = "first basket entry";
+            string eReason= signals[i].reason;
+            if(isHedge && EquityProtectionPauseActive())
+            {
+               eKind   = "equity protection hedge entry";
+               eReason = (StringLen(eReason) > 0 ? eReason + "; " : "")
+                       + StringFormat("EP emergency hedge dir=%s", DirectionName(g_modules[i].cfg.direction));
+            }
+            if(ExecuteEntry(i, bid2, eKind, eReason)) openedThisBar++;
+         }
+      }
+   }
+   if(openedThisBar > 0) RefreshBaskets();
+}
+
+//==========================================================================
+//  TODAY CLOSED PROFIT
+//==========================================================================
+double TodayClosedProfit()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   dt.hour = 0; dt.min = 0; dt.sec = 0;
+   datetime dayStart = StructToTime(dt);
+   if(!HistorySelect(dayStart, TimeCurrent())) return 0.0;
+   double profit = 0.0;
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != g_symbol) continue;
+      if((long)HistoryDealGetInteger(ticket, DEAL_MAGIC) != InpMagicNumber) continue;
+      long entry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY) continue;
+      profit += HistoryDealGetDouble(ticket, DEAL_PROFIT);
+      profit += HistoryDealGetDouble(ticket, DEAL_SWAP);
+      profit += HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+   }
+   return profit;
+}
+
+string CurrentSessionName()
+{
+   datetime now = TimeCurrent();
+   string names = "";
+   for(int i = 0; i < MODULE_COUNT; i++)
+      if(IsSessionActive(g_modules[i].cfg, now))
+      {
+         if(StringLen(names) > 0) names += ",";
+         names += g_modules[i].cfg.tag;
+      }
+   return (StringLen(names) == 0) ? "Off" : names;
+}
+
+//==========================================================================
+//  PANEL — MODERN DARK GLASS THEME  (Zentry Gold Matrix EA V1)
+//==========================================================================
+
+// Object name prefix for all panel objects
+#define ZGM_PFX   "ZGM_P_"
+
+// Panel geometry
+#define PNL_W     396    // panel width in pixels
+#define PNL_XR    6      // distance from right edge of chart
+#define PNL_YT    6      // distance from top of chart
+
+// Row heights (pixels)
+#define RH_HDR    30
+#define RH_ACC    54
+#define RH_SEP    3
+#define RH_ZHDR   20
+#define RH_ZON    22
+#define RH_MKT    22
+#define RH_STT    22
+#define RH_BTN    28
+#define RH_PAD    6
+
+// Total panel height (auto-computed)
+#define PNL_H (RH_HDR+RH_ACC+RH_SEP+RH_ZHDR+MODULE_COUNT*RH_ZON+RH_SEP+RH_MKT+RH_STT+RH_SEP+RH_BTN+RH_PAD)
+
+// ── Color palette ─────────────────────────────────────────────────────────────
+#define C_BG    (color)0x1C1C2E   // deep navy background
+#define C_HDR   (color)0x0A0A1A   // header bar (darkest)
+#define C_CARD  (color)0x16213E   // card background blue
+#define C_CARD2 (color)0x1E2A4A   // alternate card
+#define C_SEP   (color)0x2A2A50   // separator / border
+#define C_DRK   (color)0x111122   // zone header dark
+#define C_ACC   (color)0xE94560   // Zentry accent (warm red)
+#define C_GOLD  (color)0xFFCC44   // gold text
+#define C_GRN   (color)0x2ECC71   // profit green
+#define C_RED   (color)0xE74C3C   // loss red
+#define C_ORG   (color)0xF39C12   // warning orange
+#define C_BLU   (color)0x3498DB   // info blue
+#define C_PRP   (color)0x9B59B6   // purple (cloud)
+#define C_WHT   (color)0xECF0F1   // near-white text
+#define C_GRY   (color)0x95A5A6   // muted grey
+#define C_DIM   (color)0x52616B   // dim/off text
+
+// ── Coordinate helpers (panel-local → MT5 CORNER_RIGHT_UPPER) ─────────────────
+// With CORNER_RIGHT_UPPER: XDISTANCE is measured from the right edge.
+// For an element at local x (0=panel-left, PNL_W=panel-right):
+//   XDISTANCE = PNL_XR + (PNL_W - local_x)
+int PX(int lx) { return PNL_XR + (PNL_W - lx); }
+int PY(int ly) { return PNL_YT + ly; }
+
+// ── Object creation helpers ───────────────────────────────────────────────────
+void MkRect(string id, int lx, int ly, int w, int h, color bg, color brd)
+{
+   string nm = ZGM_PFX + id;
+   if(ObjectFind(0,nm) < 0) ObjectCreate(0,nm,OBJ_RECTANGLE_LABEL,0,0,0);
+   ObjectSetInteger(0,nm,OBJPROP_CORNER,     CORNER_RIGHT_UPPER);
+   ObjectSetInteger(0,nm,OBJPROP_XDISTANCE,  PX(lx+w));
+   ObjectSetInteger(0,nm,OBJPROP_YDISTANCE,  PY(ly));
+   ObjectSetInteger(0,nm,OBJPROP_XSIZE,      w);
+   ObjectSetInteger(0,nm,OBJPROP_YSIZE,      h);
+   ObjectSetInteger(0,nm,OBJPROP_BGCOLOR,    bg);
+   ObjectSetInteger(0,nm,OBJPROP_COLOR,      brd);
+   ObjectSetInteger(0,nm,OBJPROP_BORDER_TYPE,BORDER_FLAT);
+   ObjectSetInteger(0,nm,OBJPROP_BACK,       false);
+   ObjectSetInteger(0,nm,OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0,nm,OBJPROP_HIDDEN,     true);
+   ObjectSetInteger(0,nm,OBJPROP_ZORDER,     0);
+}
+
+void MkLbl(string id, int lx, int ly, string txt, color clr, int sz=8, bool bld=false)
+{
+   string nm = ZGM_PFX + id;
+   if(ObjectFind(0,nm) < 0)
+   {
+      ObjectCreate(0,nm,OBJ_LABEL,0,0,0);
+      ObjectSetInteger(0,nm,OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
+      ObjectSetInteger(0,nm,OBJPROP_ANCHOR,    ANCHOR_LEFT_UPPER);
+      ObjectSetInteger(0,nm,OBJPROP_SELECTABLE,false);
+      ObjectSetInteger(0,nm,OBJPROP_HIDDEN,    true);
+      ObjectSetInteger(0,nm,OBJPROP_ZORDER,    2);
+   }
+   ObjectSetInteger(0,nm,OBJPROP_XDISTANCE, PX(lx + (int)StringLen(txt)*sz));
+   ObjectSetInteger(0,nm,OBJPROP_YDISTANCE, PY(ly));
+   ObjectSetInteger(0,nm,OBJPROP_COLOR,     clr);
+   ObjectSetString(0, nm,OBJPROP_FONT,      bld ? "Arial Bold" : InpFont);
+   ObjectSetInteger(0,nm,OBJPROP_FONTSIZE,  sz);
+   ObjectSetString(0, nm,OBJPROP_TEXT,      txt);
+}
+
+void MkLblFixed(string id, int lx, int ly, string txt, color clr, int sz=8, bool bld=false)
+{
+   // Version with fixed xdistance (not text-length-based)
+   string nm = ZGM_PFX + id;
+   if(ObjectFind(0,nm) < 0)
+   {
+      ObjectCreate(0,nm,OBJ_LABEL,0,0,0);
+      ObjectSetInteger(0,nm,OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
+      ObjectSetInteger(0,nm,OBJPROP_ANCHOR,    ANCHOR_LEFT_UPPER);
+      ObjectSetInteger(0,nm,OBJPROP_SELECTABLE,false);
+      ObjectSetInteger(0,nm,OBJPROP_HIDDEN,    true);
+      ObjectSetInteger(0,nm,OBJPROP_ZORDER,    2);
+   }
+   ObjectSetInteger(0,nm,OBJPROP_XDISTANCE, PX(lx + PNL_W - 4));
+   ObjectSetInteger(0,nm,OBJPROP_YDISTANCE, PY(ly));
+   ObjectSetInteger(0,nm,OBJPROP_COLOR,     clr);
+   ObjectSetString(0, nm,OBJPROP_FONT,      bld ? "Arial Bold" : InpFont);
+   ObjectSetInteger(0,nm,OBJPROP_FONTSIZE,  sz);
+   ObjectSetString(0, nm,OBJPROP_TEXT,      txt);
+}
+
+void L(string id, int lx, int ly, string txt, color clr, int sz=8, bool b=false)
+{
+   // Simplified label: lx is distance from panel LEFT (position from right = PNL_XR + PNL_W - lx)
+   string nm = ZGM_PFX + id;
+   if(ObjectFind(0,nm) < 0)
+   {
+      ObjectCreate(0,nm,OBJ_LABEL,0,0,0);
+      ObjectSetInteger(0,nm,OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
+      ObjectSetInteger(0,nm,OBJPROP_ANCHOR,    ANCHOR_LEFT_UPPER);
+      ObjectSetInteger(0,nm,OBJPROP_SELECTABLE,false);
+      ObjectSetInteger(0,nm,OBJPROP_HIDDEN,    true);
+      ObjectSetInteger(0,nm,OBJPROP_ZORDER,    2);
+   }
+   ObjectSetInteger(0,nm,OBJPROP_XDISTANCE, PNL_XR + PNL_W - lx);
+   ObjectSetInteger(0,nm,OBJPROP_YDISTANCE, PY(ly));
+   ObjectSetInteger(0,nm,OBJPROP_COLOR,     clr);
+   ObjectSetString(0, nm,OBJPROP_FONT,      b ? "Arial Bold" : InpFont);
+   ObjectSetInteger(0,nm,OBJPROP_FONTSIZE,  sz);
+   ObjectSetString(0, nm,OBJPROP_TEXT,      txt);
+}
+
+void MkBtn(string id, int lx, int ly, int w, int h, string txt, color bg, color tc)
+{
+   string nm = ZGM_PFX + id;
+   if(ObjectFind(0,nm) < 0)
+   {
+      ObjectCreate(0,nm,OBJ_BUTTON,0,0,0);
+      ObjectSetInteger(0,nm,OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
+      ObjectSetInteger(0,nm,OBJPROP_SELECTABLE,false);
+      ObjectSetInteger(0,nm,OBJPROP_HIDDEN,    false);
+      ObjectSetInteger(0,nm,OBJPROP_ZORDER,    3);
+   }
+   ObjectSetInteger(0,nm,OBJPROP_XDISTANCE, PNL_XR + PNL_W - lx - w);
+   ObjectSetInteger(0,nm,OBJPROP_YDISTANCE, PY(ly));
+   ObjectSetInteger(0,nm,OBJPROP_XSIZE,     w);
+   ObjectSetInteger(0,nm,OBJPROP_YSIZE,     h);
+   ObjectSetInteger(0,nm,OBJPROP_BGCOLOR,   bg);
+   ObjectSetInteger(0,nm,OBJPROP_COLOR,     tc);
+   ObjectSetString(0, nm,OBJPROP_FONT,      "Arial Bold");
+   ObjectSetInteger(0,nm,OBJPROP_FONTSIZE,  7);
+   ObjectSetString(0, nm,OBJPROP_TEXT,      txt);
+   ObjectSetInteger(0,nm,OBJPROP_STATE,     false);
+}
+
+void DeletePanel()
+{
+   for(int i=ObjectsTotal(0,0,-1)-1; i>=0; i--)
+   {
+      string nm = ObjectName(0,i,0,-1);
+      if(StringFind(nm,ZGM_PFX)==0 || StringFind(nm,"ZGM_LINE_")==0)
+         ObjectDelete(0,nm);
+   }
+}
+
+//==========================================================================
+//  WHY NO TRADE — Diagnostic Engine
+//==========================================================================
+string WhyNoTrade(int idx, double &outScore)
+{
+   outScore = 0.0;
+   if(!g_regime.ready) return "regime not ready";
+   ModuleConfig cfg = g_modules[idx].cfg;
+   if(!cfg.enabled)    return "zone disabled";
+   datetime now = TimeCurrent();
+   MqlDateTime dt; TimeToStruct(now, dt);
+   if(IsXmasBlocked(now))          return "holiday block";
+   if(!IsTradingWeekday(dt.day_of_week)) return "weekend";
+   if(g_paused)                    return "EA paused";
+   if(EquityProtectionPauseActive()) return "equity protect";
+   if(!IsSessionActive(cfg, now))  return "no active session";
+   if(g_modules[idx].basket.active) { outScore = 0.0; return ""; } // basket open = normal
+   if(InpBlockFridayNightEntry && dt.day_of_week==5 && dt.hour>=22) return "Fri night block";
+   if(OpenBasketCount() >= InpMaxGlobalBaskets) return StringFormat("max baskets(%d)", InpMaxGlobalBaskets);
+   double sp = SpreadPoints();
+   if(sp > (double)InpSpread) return StringFormat("spread %.0f>%d", sp, InpSpread);
+   if(!AtrAllowed(g_regime))
+   {
+      if(g_regime.atrM1Points < InpMinAtrM1Points)
+         return StringFormat("ATR low(%.0f<%.0f)", g_regime.atrM1Points, InpMinAtrM1Points);
+      return StringFormat("ATR high(%.0f>%.0f)", g_regime.atrM1Points, InpMaxAtrM1Points);
+   }
+   if(TimeCurrent() < g_modules[idx].cooldownUntil)
+   {
+      int s = (int)(g_modules[idx].cooldownUntil - TimeCurrent());
+      return StringFormat("cooldown %dm%ds", s/60, s%60);
+   }
+   SignalInfo sig; BuildSignal(idx, g_regime, sig);
+   outScore = sig.score;
+   if(sig.valid) return "ready to trade";
+   // Break down what's missing
+   string miss = "";
+   double gap = cfg.scoreMin - sig.score;
+   if(gap > 0.0) miss = StringFormat("score %.2f<%.2f (gap %.2f)", sig.score, cfg.scoreMin, gap);
+   return miss;
+}
+
+//==========================================================================
+//  PANEL DRAW FUNCTIONS
+//==========================================================================
+
+void DrawPanelBg()
+{
+   // Outer panel
+   MkRect("BG",      0, 0, PNL_W, PNL_H, C_BG,   C_SEP);
+   // Header
+   MkRect("H_BG",    0, 0, PNL_W, RH_HDR, C_HDR,  C_ACC);
+   // Accent left stripe
+   MkRect("H_STR",   0, 0, 3,     RH_HDR, C_ACC,  C_ACC);
+   // Account row
+   MkRect("A_BG",    0, RH_HDR, PNL_W, RH_ACC, C_CARD, C_SEP);
+   // Account sub-cards (4 columns)
+   int cw = (PNL_W - 10) / 4;
+   for(int c=0; c<4; c++)
+      MkRect(StringFormat("A_C%d",c), 2+c*(cw+2), RH_HDR+2, cw, RH_ACC-4, C_BG, C_SEP);
+   // Zone section
+   int zy = RH_HDR + RH_ACC + RH_SEP;
+   MkRect("ZH_BG",   0, zy, PNL_W, RH_ZHDR, C_DRK,  C_SEP);
+   for(int z=0; z<MODULE_COUNT; z++)
+      MkRect(StringFormat("ZR%d",z), 0, zy+RH_ZHDR+z*RH_ZON, PNL_W, RH_ZON,
+             (z%2==0)?C_CARD:C_BG, C_SEP);
+   // Market row
+   int my = zy + RH_ZHDR + MODULE_COUNT*RH_ZON + RH_SEP;
+   MkRect("M_BG",    0, my, PNL_W, RH_MKT, C_DRK, C_SEP);
+   // Stats row
+   MkRect("S_BG",    0, my+RH_MKT, PNL_W, RH_STT, C_CARD2, C_SEP);
+   // Button row
+   int by = my + RH_MKT + RH_STT + RH_SEP;
+   MkRect("BTN_BG",  0, by, PNL_W, RH_BTN+RH_PAD, C_HDR, C_ACC);
+   MkRect("BTN_STR", 0, by, 3, RH_BTN+RH_PAD, C_PRP, C_PRP);
+}
+
+void DrawHeader()
+{
+   string liveStr = g_paused ? "⏸ PAUSED" : "● LIVE";
+   color  liveClr = g_paused ? C_ORG : C_GRN;
+   L("H_LIVE",  380, 10, liveStr, liveClr, 7, true);
+   L("H_NAME",  296, 10, "ZENTRY GOLD MATRIX  |  " + g_symbol, C_GOLD, 8, true);
+   string ts = TimeToString(TimeCurrent(), TIME_MINUTES|TIME_SECONDS);
+   L("H_TIME",  70,  10, ts, C_GRY, 7);
+}
+
+void DrawAccount()
+{
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   double eq  = AccountInfoDouble(ACCOUNT_EQUITY);
+   double flt = TotalFloatingProfit();
+   double tod = TodayClosedProfit();
+   double dd  = (bal > 0.0) ? MathMax(0.0,(bal-eq)/bal*100.0) : 0.0;
+   int cw = (PNL_W - 10) / 4;
+   int ay = RH_HDR;
+
+   // Card 0 — Balance
+   L("A_L0", 2+0*(cw+2)+5, ay+5,  "BALANCE",            C_GRY, 7);
+   L("A_V0", 2+0*(cw+2)+5, ay+17, StringFormat("$%.2f",bal), C_WHT, 8, true);
+   // Card 1 — Equity
+   L("A_L1", 2+1*(cw+2)+5, ay+5,  "EQUITY",             C_GRY, 7);
+   color eqClr = (eq >= bal) ? C_GRN : C_RED;
+   L("A_V1", 2+1*(cw+2)+5, ay+17, StringFormat("$%.2f",eq), eqClr, 8, true);
+   // Card 2 — Floating
+   L("A_L2", 2+2*(cw+2)+5, ay+5,  "FLOAT P/L",          C_GRY, 7);
+   color fClr = (flt>=0.0)?C_GRN:C_RED;
+   L("A_V2", 2+2*(cw+2)+5, ay+17, StringFormat("%+.2f",flt), fClr, 8, true);
+   // Card 3 — Drawdown + Today
+   L("A_L3", 2+3*(cw+2)+5, ay+5,  "DD%  TODAY",         C_GRY, 7);
+   color dClr = (dd<5.0)?C_GRN:(dd<15.0?C_ORG:C_RED);
+   L("A_V3", 2+3*(cw+2)+5, ay+17, StringFormat("%.1f%%  %+.2f",dd,tod), dClr, 8, true);
+   // Spread + ATR sub-info
+   double sp2 = SpreadPoints();
+   color sClr = (sp2 <= InpSpread) ? C_GRN : C_RED;
+   L("A_SP", 2+3*(cw+2)+5, ay+36, StringFormat("SPR:%.0f  ATR:%.0f", sp2, g_regime.atrM1Points), sClr, 7);
+}
+
+void DrawZoneTable()
+{
+   int zy  = RH_HDR + RH_ACC + RH_SEP;
+   // Column headers
+   L("ZH_ZN", 6,   zy+5, "ZONE",    C_GRY, 7, true);
+   L("ZH_ST", 78,  zy+5, "STATUS",  C_GRY, 7, true);
+   L("ZH_SC", 150, zy+5, "SCORE",   C_GRY, 7, true);
+   L("ZH_PO", 196, zy+5, "POS",     C_GRY, 7, true);
+   L("ZH_FL", 236, zy+5, "FLOAT",   C_GRY, 7, true);
+   L("ZH_WH", 282, zy+5, "WHY / REASON", C_GRY, 7, true);
+
+   for(int i=0; i<MODULE_COUNT; i++)
+   {
+      int ry = zy + RH_ZHDR + i*RH_ZON + 4;
+      double sc = 0.0;
+      string why = WhyNoTrade(i, sc);
+      BasketState b   = g_modules[i].basket;
+      bool sOn        = IsSessionActive(g_modules[i].cfg, TimeCurrent());
+      bool wouldTrade = (why == "ready to trade");
+
+      // Status dot + color
+      color stClr;
+      string stTxt;
+      if(b.active)     { stClr=C_BLU;  stTxt=StringFormat("OPEN(%d)", b.entries); }
+      else if(!sOn)    { stClr=C_DIM;  stTxt="OFF"; }
+      else if(wouldTrade){ stClr=C_GRN; stTxt="READY"; }
+      else             { stClr=C_ORG;  stTxt="WAIT"; }
+
+      // Zone tag
+      L(StringFormat("ZN%d_T",i), 6,   ry, g_modules[i].cfg.tag, C_WHT, 7, true);
+      // Status
+      string dot = b.active ? "●" : (sOn ? "○" : "─");
+      L(StringFormat("ZN%d_D",i), 78,  ry, dot,   stClr, 9);
+      L(StringFormat("ZN%d_S",i), 93,  ry, stTxt, stClr, 7);
+      // Score
+      string scStr;
+      color  scClr;
+      if(sc > 0.0) { scStr=StringFormat("%.2f",sc); scClr=(sc>=g_modules[i].cfg.scoreMin)?C_GRN:C_ORG; }
+      else         { scStr="—"; scClr=C_DIM; }
+      L(StringFormat("ZN%d_SC",i),150, ry, scStr, scClr, 7);
+      // Positions
+      string poStr = b.active ? StringFormat("%d×%s %.2fL", b.entries,
+                     (g_modules[i].cfg.direction==DIR_BUY?"↑":"↓"), b.totalLots) : "—";
+      L(StringFormat("ZN%d_P",i), 196, ry, poStr, b.active?C_BLU:C_DIM, 7);
+      // Float
+      string flStr = b.active ? StringFormat("%+.2f",b.floatingProfit) : "—";
+      color  flClr = b.active ? (b.floatingProfit>=0.0?C_GRN:C_RED) : C_DIM;
+      L(StringFormat("ZN%d_F",i), 236, ry, flStr, flClr, 7);
+      // Why / age
+      string whStr;
+      color  whClr;
+      if(b.active)
+      {
+         int ageMins = (int)((TimeCurrent()-b.firstEntryTime)/60);
+         whStr = StringFormat("age %dm  avg %.2f", ageMins, b.weightedAvgPrice);
+         whClr = C_GRY;
+      }
+      else { whStr=(StringLen(why)>0?why:"—"); whClr=(wouldTrade?C_GRN:C_ORG); }
+      L(StringFormat("ZN%d_W",i), 282, ry, whStr, whClr, 7);
+   }
+}
+
+void DrawMarketRow()
+{
+   int my = RH_HDR + RH_ACC + RH_SEP + RH_ZHDR + MODULE_COUNT*RH_ZON + RH_SEP;
+   int ry = my + 4;
+   string s5d  = (g_regime.slopeM5Points  > 5.0) ? "▲" : (g_regime.slopeM5Points  < -5.0 ? "▼" : "─");
+   string s15d = (g_regime.slopeM15Points > 5.0) ? "▲" : (g_regime.slopeM15Points < -5.0 ? "▼" : "─");
+   color  s5c  = (g_regime.slopeM5Points  > 5.0) ? C_GRN : (g_regime.slopeM5Points  < -5.0 ? C_RED : C_GRY);
+   color  s15c = (g_regime.slopeM15Points > 5.0) ? C_GRN : (g_regime.slopeM15Points < -5.0 ? C_RED : C_GRY);
+   string regime = g_regime.compressionM1 ? "COMPRESS" : (g_regime.expansionM1 ? "EXPAND" : "NEUTRAL");
+   color  rClr   = g_regime.compressionM1 ? C_ORG : (g_regime.expansionM1 ? C_BLU : C_GRY);
+   L("MK_ATR",   6,   ry, StringFormat("ATR:%.0fpt",  g_regime.atrM1Points), C_GRY, 7);
+   L("MK_M5",    96,  ry, StringFormat("M5:%s%.0f",   s5d,  MathAbs(g_regime.slopeM5Points)),  s5c,  7);
+   L("MK_M15",   182, ry, StringFormat("M15:%s%.0f",  s15d, MathAbs(g_regime.slopeM15Points)), s15c, 7);
+   L("MK_RGM",   270, ry, regime, rClr, 7, true);
+}
+
+void DrawStatsRow()
+{
+   int sy = RH_HDR + RH_ACC + RH_SEP + RH_ZHDR + MODULE_COUNT*RH_ZON + RH_SEP + RH_MKT;
+   int ry = sy + 4;
+   // Count closed deals
+   HistorySelect(0, TimeCurrent());
+   int  trades=0; double won=0, totPnl=0, grossWin=0, grossLoss=0;
+   for(int d=0; d<HistoryDealsTotal(); d++)
+   {
+      ulong tk = HistoryDealGetTicket(d);
+      if(HistoryDealGetInteger(tk,DEAL_MAGIC)!=InpMagicNumber) continue;
+      if(HistoryDealGetString(tk,DEAL_SYMBOL)!=g_symbol) continue;
+      if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(tk,DEAL_ENTRY)!=DEAL_ENTRY_OUT) continue;
+      double dp = HistoryDealGetDouble(tk,DEAL_PROFIT)+HistoryDealGetDouble(tk,DEAL_COMMISSION)+HistoryDealGetDouble(tk,DEAL_SWAP);
+      trades++; totPnl += dp;
+      if(dp >= 0.0) { won++; grossWin  += dp; }
+      else            grossLoss += MathAbs(dp);
+   }
+   double wr = (trades>0) ? won/trades*100.0 : 0.0;
+   double pf = (grossLoss>0.0) ? grossWin/grossLoss : (grossWin>0?9.9:0.0);
+   double netPnl = AccountInfoDouble(ACCOUNT_BALANCE) - g_startBalance;
+   L("ST_TR",  6,   ry, StringFormat("TRADES:%d",  trades), C_GRY, 7);
+   L("ST_WR",  96,  ry, StringFormat("WIN:%.0f%%", wr),     wr>=70?C_GRN:(wr>=50?C_ORG:C_RED), 7);
+   L("ST_PF",  182, ry, StringFormat("PF:%.2f",    pf),     pf>=2?C_GRN:(pf>=1?C_ORG:C_RED), 7);
+   L("ST_NET", 270, ry, StringFormat("NET:%+.2f",  netPnl), netPnl>=0?C_GRN:C_RED, 7, true);
+}
+
+void DrawButtons()
+{
+   int by  = RH_HDR + RH_ACC + RH_SEP + RH_ZHDR + MODULE_COUNT*RH_ZON + RH_SEP + RH_MKT + RH_STT + RH_SEP;
+   int bw  = 90; int bh = 20; int gap = 4; int bry = by + 5;
+   string pTxt = g_paused ? "▶ RESUME" : "⏸ PAUSE";
+   color  pClr = g_paused ? C_GRN     : (color)0x2980B9;
+   MkBtn("BTN_PAUSE", gap,             bry, bw, bh, pTxt,           pClr,              C_WHT);
+   MkBtn("BTN_CLOSE", gap+bw+gap,      bry, bw, bh, "✖ CLOSE ALL",  C_RED,             C_WHT);
+   MkBtn("BTN_DASH",  gap+2*(bw+gap),  bry, bw, bh, "◉ DASHBOARD",  (color)0x16A085,   C_WHT);
+   MkBtn("BTN_CLOUD", gap+3*(bw+gap),  bry, bw, bh, "☁ CLOUDFLARE", C_PRP,             C_GOLD);
+}
+
+void UpdatePanel()
+{
+   if(InpPanel <= 0) return;
+   if(TimeCurrent() == g_lastPanelUpdate) return;
+   g_lastPanelUpdate = TimeCurrent();
+   RefreshBaskets();
+   DrawPanelBg();
+   DrawHeader();
+   DrawAccount();
+   DrawZoneTable();
+   DrawMarketRow();
+   DrawStatsRow();
+   DrawButtons();
+   DrawBasketLines();
+   ChartRedraw(0);
+}
+
+void DrawBasketLines()
+{
+   for(int i=0; i<MODULE_COUNT; i++)
+   {
+      string base = "ZGM_LINE_" + g_modules[i].cfg.tag;
+      StringReplace(base,"/","_");
+      string avgNm = base+"_AVG";
+      string tpNm  = base+"_TP";
+      BasketState b = g_modules[i].basket;
+      if(!b.active)
+      {
+         if(ObjectFind(0,avgNm)>=0) ObjectDelete(0,avgNm);
+         if(ObjectFind(0,tpNm) >=0) ObjectDelete(0,tpNm);
+         continue;
+      }
+      double buf  = TargetBufferPoints(g_modules[i].cfg, g_regime);
+      double tpPr = b.weightedAvgPrice + (b.direction==DIR_BUY ? buf : -buf)*g_point;
+
+      if(ObjectFind(0,avgNm)<0) ObjectCreate(0,avgNm,OBJ_HLINE,0,0,b.weightedAvgPrice);
+      ObjectSetDouble(0, avgNm,OBJPROP_PRICE, b.weightedAvgPrice);
+      ObjectSetInteger(0,avgNm,OBJPROP_COLOR, C_ORG);
+      ObjectSetInteger(0,avgNm,OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0,avgNm,OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0,avgNm,OBJPROP_SELECTABLE,false);
+      ObjectSetInteger(0,avgNm,OBJPROP_HIDDEN,true);
+
+      if(ObjectFind(0,tpNm)<0) ObjectCreate(0,tpNm,OBJ_HLINE,0,0,tpPr);
+      ObjectSetDouble(0, tpNm, OBJPROP_PRICE, tpPr);
+      ObjectSetInteger(0,tpNm, OBJPROP_COLOR, C_GRN);
+      ObjectSetInteger(0,tpNm, OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(0,tpNm, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0,tpNm, OBJPROP_SELECTABLE,false);
+      ObjectSetInteger(0,tpNm, OBJPROP_HIDDEN,true);
+   }
+}
+
+//==========================================================================
+//  JSON DATA EXPORT  (writes MQL5/Files/zentry_live.json every bar)
+//==========================================================================
+void WriteJsonData()
+{
+   if(!InpUseCsvLog) return;
+   int h = FileOpen("zentry_live.json", FILE_WRITE|FILE_TXT|FILE_COMMON|FILE_ANSI);
+   if(h == INVALID_HANDLE) return;
+
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   double eq  = AccountInfoDouble(ACCOUNT_EQUITY);
+   double flt = TotalFloatingProfit();
+   double tod = TodayClosedProfit();
+   double dd  = (bal>0.0) ? MathMax(0.0,(bal-eq)/bal*100.0) : 0.0;
+   string ts  = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
+   StringReplace(ts," ","T");
+
+   FileWriteString(h,"{\n");
+   FileWriteString(h, StringFormat("  \"ea\":\"%s\",\n",          EA_NAME));
+   FileWriteString(h, StringFormat("  \"symbol\":\"%s\",\n",      g_symbol));
+   FileWriteString(h, StringFormat("  \"time\":\"%s\",\n",        ts));
+   FileWriteString(h, StringFormat("  \"balance\":%.2f,\n",       bal));
+   FileWriteString(h, StringFormat("  \"equity\":%.2f,\n",        eq));
+   FileWriteString(h, StringFormat("  \"floating\":%.2f,\n",      flt));
+   FileWriteString(h, StringFormat("  \"todayPnl\":%.2f,\n",      tod));
+   FileWriteString(h, StringFormat("  \"drawdown\":%.2f,\n",      dd));
+   FileWriteString(h, StringFormat("  \"startBalance\":%.2f,\n",  g_startBalance));
+   FileWriteString(h, StringFormat("  \"spread\":%.0f,\n",        SpreadPoints()));
+   FileWriteString(h, StringFormat("  \"atrM1\":%.0f,\n",         g_regime.atrM1Points));
+   FileWriteString(h, StringFormat("  \"slopeM5\":%.1f,\n",       g_regime.slopeM5Points));
+   FileWriteString(h, StringFormat("  \"slopeM15\":%.1f,\n",      g_regime.slopeM15Points));
+   FileWriteString(h, StringFormat("  \"compress\":%s,\n",        g_regime.compressionM1?"true":"false"));
+   FileWriteString(h, StringFormat("  \"expand\":%s,\n",          g_regime.expansionM1  ?"true":"false"));
+   FileWriteString(h, StringFormat("  \"paused\":%s,\n",          g_paused              ?"true":"false"));
+   FileWriteString(h, StringFormat("  \"openBaskets\":%d,\n",     OpenBasketCount()));
+   FileWriteString(h, StringFormat("  \"totalLots\":%.2f,\n",     TotalOpenLots()));
+   // Zones array
+   FileWriteString(h,"  \"zones\":[\n");
+   for(int i=0; i<MODULE_COUNT; i++)
+   {
+      double sc=0.0;
+      string why = WhyNoTrade(i,sc);
+      BasketState b = g_modules[i].basket;
+      bool sOn = IsSessionActive(g_modules[i].cfg, TimeCurrent());
+      int  age = b.active ? (int)((TimeCurrent()-b.firstEntryTime)/60) : 0;
+      FileWriteString(h, StringFormat(
+         "    {\"tag\":\"%s\",\"session\":%s,\"open\":%s,\"positions\":%d,"
+         "\"lots\":%.2f,\"dir\":\"%s\",\"floating\":%.2f,\"avgPrice\":%.2f,"
+         "\"score\":%.2f,\"scoreMin\":%.2f,\"why\":\"%s\",\"ageMins\":%d}%s\n",
+         g_modules[i].cfg.tag,
+         sOn?"true":"false", b.active?"true":"false",
+         b.entries, b.totalLots,
+         (g_modules[i].cfg.direction==DIR_BUY?"BUY":"SELL"),
+         b.floatingProfit, b.weightedAvgPrice,
+         sc, g_modules[i].cfg.scoreMin, why, age,
+         (i<MODULE_COUNT-1)?",":""));
+   }
+   FileWriteString(h,"  ],\n");
+   // Close reason stats
+   FileWriteString(h,"  \"closeReasons\":{\n");
+   for(int r=0; r<CR_COUNT; r++)
+      FileWriteString(h, StringFormat("    \"%s\":%d%s\n",
+         g_reasonNames[r], g_reasonCounts[r], (r<CR_COUNT-1)?",":""));
+   FileWriteString(h,"  },\n");
+   // Last 25 closed deals
+   FileWriteString(h,"  \"trades\":[\n");
+   HistorySelect(0, TimeCurrent());
+   int dTotal=HistoryDealsTotal(), written=0, maxT=25;
+   for(int d=dTotal-1; d>=0 && written<maxT; d--)
+   {
+      ulong tk=HistoryDealGetTicket(d);
+      if(HistoryDealGetInteger(tk,DEAL_MAGIC)!=InpMagicNumber) continue;
+      if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(tk,DEAL_ENTRY)!=DEAL_ENTRY_OUT) continue;
+      double dp=HistoryDealGetDouble(tk,DEAL_PROFIT)+HistoryDealGetDouble(tk,DEAL_COMMISSION)+HistoryDealGetDouble(tk,DEAL_SWAP);
+      string dt2=TimeToString((datetime)HistoryDealGetInteger(tk,DEAL_TIME),TIME_DATE|TIME_SECONDS);
+      StringReplace(dt2," ","T");
+      string cmt=HistoryDealGetString(tk,DEAL_COMMENT);
+      FileWriteString(h, StringFormat(
+         "    {\"time\":\"%s\",\"profit\":%.2f,\"lots\":%.2f,\"comment\":\"%s\"}%s\n",
+         dt2, dp, HistoryDealGetDouble(tk,DEAL_VOLUME), cmt,
+         (written<maxT-1 && d>0)?",":""));
+      written++;
+   }
+   FileWriteString(h,"  ]\n}\n");
+   FileClose(h);
+}
+
+//==========================================================================
+//  CHART EVENT HANDLER — Panel Button Clicks
+//==========================================================================
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   if(id != CHARTEVENT_OBJECT_CLICK) return;
+
+   if(sparam == ZGM_PFX+"BTN_PAUSE")
+   {
+      g_paused = !g_paused;
+      LogEvent("PANEL", StringFormat("EA %s via panel", g_paused?"PAUSED":"RESUMED"));
+      UpdatePanel();
+      ObjectSetInteger(0, ZGM_PFX+"BTN_PAUSE", OBJPROP_STATE, false);
+      return;
+   }
+   if(sparam == ZGM_PFX+"BTN_CLOSE")
+   {
+      LogEvent("PANEL", "Close All — requested via panel button");
+      CloseAllBaskets(CR_SESSION_END, "panel close-all", true);
+      ObjectSetInteger(0, ZGM_PFX+"BTN_CLOSE", OBJPROP_STATE, false);
+      return;
+   }
+   if(sparam == ZGM_PFX+"BTN_DASH")
+   {
+      WriteJsonData();
+      // Write open-flag so the Python server opens the browser
+      int fh = FileOpen("zentry_open_dash.flag", FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
+      if(fh!=INVALID_HANDLE) { FileWriteString(fh,"1"); FileClose(fh); }
+      LogEvent("PANEL", "Dashboard: run zentry_server.py then visit http://localhost:8765");
+      ObjectSetInteger(0, ZGM_PFX+"BTN_DASH", OBJPROP_STATE, false);
+      return;
+   }
+   if(sparam == ZGM_PFX+"BTN_CLOUD")
+   {
+      WriteJsonData();
+      int fh = FileOpen("zentry_open_cloud.flag", FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
+      if(fh!=INVALID_HANDLE) { FileWriteString(fh,"1"); FileClose(fh); }
+      LogEvent("PANEL", "Cloudflare push requested — run zentry_server.py with CF_WORKER_URL set");
+      ObjectSetInteger(0, ZGM_PFX+"BTN_CLOUD", OBJPROP_STATE, false);
+      return;
+   }
+}
+
+//==========================================================================
+//  INDICATOR INIT
+//==========================================================================
+//  INDICATOR INIT / RELEASE
+//==========================================================================
+bool InitializeIndicators()
+{
+   g_atrM1     = iATR(g_symbol, PERIOD_M1,  InpAtrPeriod);
+   g_atrM5     = iATR(g_symbol, PERIOD_M5,  InpAtrPeriod);
+   g_atrM15    = iATR(g_symbol, PERIOD_M15, InpAtrPeriod);
+   g_emaFastM5 = iMA(g_symbol, PERIOD_M5,  InpFastEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   g_emaSlowM5 = iMA(g_symbol, PERIOD_M5,  InpSlowEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   g_emaFastM15= iMA(g_symbol, PERIOD_M15, InpFastEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   g_emaSlowM15= iMA(g_symbol, PERIOD_M15, InpSlowEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   g_emaTrendH1= iMA(g_symbol, PERIOD_H1,  InpTrendEmaPeriod,0, MODE_EMA, PRICE_CLOSE);
+   if(g_atrM1 == INVALID_HANDLE || g_atrM5 == INVALID_HANDLE || g_atrM15 == INVALID_HANDLE ||
+      g_emaFastM5 == INVALID_HANDLE || g_emaSlowM5 == INVALID_HANDLE ||
+      g_emaFastM15 == INVALID_HANDLE || g_emaSlowM15 == INVALID_HANDLE || g_emaTrendH1 == INVALID_HANDLE)
+   { PrintFormat("%s [%s] indicator init failed", EA_NAME, g_symbol); return false; }
+   return true;
+}
+
+void ReleaseIndicators()
+{
+   if(g_atrM1    != INVALID_HANDLE) IndicatorRelease(g_atrM1);
+   if(g_atrM5    != INVALID_HANDLE) IndicatorRelease(g_atrM5);
+   if(g_atrM15   != INVALID_HANDLE) IndicatorRelease(g_atrM15);
+   if(g_emaFastM5!= INVALID_HANDLE) IndicatorRelease(g_emaFastM5);
+   if(g_emaSlowM5!= INVALID_HANDLE) IndicatorRelease(g_emaSlowM5);
+   if(g_emaFastM15!=INVALID_HANDLE) IndicatorRelease(g_emaFastM15);
+   if(g_emaSlowM15!=INVALID_HANDLE) IndicatorRelease(g_emaSlowM15);
+   if(g_emaTrendH1!=INVALID_HANDLE) IndicatorRelease(g_emaTrendH1);
+}
+
+void InitCsv()
+{
+   if(!InpUseCsvLog) return;
+   int flags = FILE_CSV|FILE_READ|FILE_WRITE|FILE_SHARE_WRITE|FILE_ANSI;
+   if(InpUseCommonCsv) flags |= FILE_COMMON;
+   g_csvHandle = FileOpen(InpCsvFileName, flags, ',');
+   if(g_csvHandle == INVALID_HANDLE) { PrintFormat("%s CSV open failed: %s", EA_NAME, InpCsvFileName); return; }
+   if(FileSize(g_csvHandle) == 0)
+      FileWrite(g_csvHandle, "time","symbol","module","basket_id","event","value1","value2","detail");
+   FileSeek(g_csvHandle, 0, SEEK_END);
+}
+
+//==========================================================================
+//  SUMMARY
+//==========================================================================
+void PrintSummary(string context)
+{
+   PrintFormat("%s [%s] %s summary. Start balance %.2f, balance %.2f, equity %.2f",
+      EA_NAME, g_symbol, context, g_startBalance,
+      AccountInfoDouble(ACCOUNT_BALANCE), AccountInfoDouble(ACCOUNT_EQUITY));
+   for(int i = 0; i < MODULE_COUNT; i++)
+   {
+      ModuleStats s  = g_modules[i].stats;
+      double avgEnt  = (s.basketCount > 0 ? (double)s.entrySum / s.basketCount : 0.0);
+      double winRate = (s.basketCount > 0 ? (double)s.winCount / s.basketCount * 100.0 : 0.0);
+      double avgHold = (s.basketCount > 0 ? (double)s.holdSecondsSum / s.basketCount / 60.0 : 0.0);
+      double avgMfe  = (s.basketCount > 0 ? s.mfeSum / s.basketCount : 0.0);
+      double avgMae  = (s.basketCount > 0 ? s.maeSum / s.basketCount : 0.0);
+      double avgExc  = (s.basketCount > 0 ? s.maxExcursionSum / s.basketCount : 0.0);
+      PrintFormat("%s [%s] module %s baskets=%d trades=%d avg_entries=%.2f win_rate=%.1f%% avg_hold=%.1fmin profit=%.2f avg_mfe=%.2f avg_mae=%.2f avg_excursion=%.1f",
+         EA_NAME, g_symbol, g_modules[i].cfg.tag,
+         s.basketCount, s.tradeCount, avgEnt, winRate, avgHold,
+         s.profitSum, avgMfe, avgMae, avgExc);
+   }
+   string reasons = "";
+   for(int r = 0; r < CR_COUNT; r++)
+   {
+      if(g_reasonCounts[r] <= 0) continue;
+      if(StringLen(reasons) > 0) reasons += ", ";
+      reasons += StringFormat("%s=%d", g_reasonNames[r], g_reasonCounts[r]);
+   }
+   if(StringLen(reasons) == 0) reasons = "none";
+   PrintFormat("%s [%s] closure reasons: %s", EA_NAME, g_symbol, reasons);
+}
+
+//==========================================================================
+//  ONINIT / ONDEINIT / ONTICK / ONTIMER / ONTESTER
+//==========================================================================
+int OnInit()
+{
+   SetReasonNames();
+   ArrayInitialize(g_reasonCounts, 0);
+
+   g_symbol = ResolveTradeSymbol();
+   if(!SymbolSelect(g_symbol, true))
+   { PrintFormat("%s symbol select failed: %s", EA_NAME, g_symbol); return INIT_FAILED; }
+
+   if(InpStrictGoldOnly && !ContainsGoldName(g_symbol))
+   { PrintFormat("%s non-gold symbol blocked: %s", EA_NAME, g_symbol); return INIT_PARAMETERS_INCORRECT; }
+
+   g_point  = SymbolInfoDouble(g_symbol, SYMBOL_POINT);
+   g_digits = (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS);
+   if(g_point <= 0.0) { PrintFormat("%s invalid point for %s", EA_NAME, g_symbol); return INIT_FAILED; }
+
+   ConfigureModules();
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpSlippage);
+   trade.SetTypeFillingBySymbol(g_symbol);
+
+   long marginMode = AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+   if(marginMode != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+      PrintFormat("%s [%s] WARNING: account is not hedging mode — baskets work best on hedging accounts", EA_NAME, g_symbol);
+
+   if(!InitializeIndicators()) return INIT_FAILED;
+
+   ArrayResize(g_ratesM1,  64);
+   ArrayResize(g_ratesM5,  64);
+   ArrayResize(g_ratesM15, 64);
+   ArrayResize(g_ratesH1,  16);
+
+   InitCsv();
+   g_startTime    = TimeCurrent();
+   g_startBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   EventSetTimer(MathMax(1, InpTimerSeconds));
+   RefreshBaskets();
+
+   PrintFormat("%s [%s] initialized. %s", EA_NAME, g_symbol, InpNoteOverview);
+   CsvLog("init", "CORE", 0, InpNoteName, g_startBalance, AccountInfoDouble(ACCOUNT_EQUITY));
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   PrintSummary("OnDeinit");
+   CsvLog("deinit", "CORE", 0, StringFormat("reason=%d", reason),
+          AccountInfoDouble(ACCOUNT_BALANCE), AccountInfoDouble(ACCOUNT_EQUITY));
+   if(g_csvHandle != INVALID_HANDLE) { FileClose(g_csvHandle); g_csvHandle = INVALID_HANDLE; }
+   EventKillTimer();
+   DeletePanel();
+   ReleaseIndicators();
+}
+
+void EnginePulse()
+{
+   if(!UpdateRegime()) { UpdatePanel(); return; }
+   RefreshBaskets();
+   ManageRiskAndExits();
+   UpdatePanel();
+   datetime curM1 = iTime(g_symbol, PERIOD_M1, 0);
+   if(curM1 <= 0) return;
+   if(curM1 != g_lastM1Bar) { g_lastM1Bar = curM1; ProcessEntryEngine(); }
+   WriteJsonData();
+}
+
+void OnTick()  { EnginePulse(); }
+void OnTimer() { EnginePulse(); }
+
+double OnTester()
+{
+   PrintSummary("OnTester");
+   return TesterStatistics(STAT_PROFIT);
+}
